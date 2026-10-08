@@ -3,6 +3,7 @@ import { Plus } from 'lucide-react';
 import { useState } from 'react';
 import { Bar, BarChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { api, Device, Incident, IncidentSeverity, IncidentSummary, useLive } from '../api';
+import { useAuth } from '../auth';
 import { clock, timeAgo } from '../format';
 import { Card, Empty, Kpi, Modal, PageHead, SeverityBadge, toast } from '../components/ui';
 
@@ -11,6 +12,7 @@ const CATEGORIES = ['Brute-force login', 'Unsigned firmware attempt', 'Unexpecte
 
 export default function Incidents() {
   const qc = useQueryClient();
+  const { isAdmin } = useAuth();
   const [status, setStatus] = useState('');
   const [adding, setAdding] = useState(false);
   const { data } = useLive<Incident[]>(`/incidents${status ? `?status=${status}` : ''}`, 4000);
@@ -27,7 +29,7 @@ export default function Incidents() {
   return (
     <>
       <PageHead title="Security incidents" desc="Security events reported by devices, consolidated into one triage queue.">
-        <button className="btn primary" onClick={() => setAdding(true)}><Plus size={15} />Report incident</button>
+        <button className="btn primary" disabled={!isAdmin} onClick={() => setAdding(true)}><Plus size={15} />Report incident</button>
       </PageHead>
 
       <div className="grid kpis">
@@ -73,7 +75,7 @@ export default function Incidents() {
                   <td style={{ maxWidth: 420 }}>{i.description}</td>
                   <td className="muted nowrap">{timeAgo(i.createdAt)}</td>
                   <td>
-                    <select className="input" style={{ padding: '3px 8px' }} value={i.status} aria-label="Incident status" onChange={(e) => setState.mutate({ id: i.id, status: e.target.value })}>
+                    <select className="input" style={{ padding: '3px 8px' }} disabled={!isAdmin} value={i.status} aria-label="Incident status" onChange={(e) => setState.mutate({ id: i.id, status: e.target.value })}>
                       <option value="open">open</option><option value="investigating">investigating</option><option value="resolved">resolved</option>
                     </select>
                   </td>

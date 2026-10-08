@@ -1,6 +1,6 @@
 import { Pool } from 'pg';
 import { config } from './config';
-import { camelize } from './util';
+import { camelize, hashKey } from './util';
 
 export const pool = new Pool({ connectionString: config.databaseUrl });
 
@@ -23,9 +23,19 @@ CREATE TABLE IF NOT EXISTS devices (
   ip_address TEXT,
   firmware_version TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'offline' CHECK (status IN ('online','offline','degraded')),
-  api_key TEXT NOT NULL UNIQUE,
+  api_key TEXT UNIQUE,          -- legacy plaintext column, emptied by migrate()
+  api_key_hash TEXT UNIQUE,     -- SHA-256 of the device key; the raw key is shown once
   simulated BOOLEAN NOT NULL DEFAULT FALSE,
   last_seen TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS users (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'viewer' CHECK (role IN ('admin','viewer')),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -97,4 +107,11 @@ CREATE TABLE IF NOT EXISTS security_incidents (
 
 export async function migrate() {
   await pool.query(SCHEMA);
+  // upgrade databases created before hashed keys: hash any plaintext key, then drop the plaintext
+  await pool.query('ALTER TABLE devices ADD COLUMN IF NOT EXISTS api_key_hash TEXT UNIQUE');
+  await pool.query('ALTER TABLE devices ALTER COLUMN api_key DROP NOT NULL');
+  const legacy = await pool.query('SELECT id, api_key FROM devices WHERE api_key IS NOT NULL');
+  for (const r of legacy.rows) {
+    await pool.query('UPDATE devices SET api_key_hash=$2, api_key=NULL WHERE id=$1', [r.id, hashKey(r.api_key)]);
+  }
 }

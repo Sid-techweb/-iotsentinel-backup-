@@ -5,6 +5,9 @@ import { ZodError } from 'zod';
 import { config } from './config';
 import { pool } from './db';
 import { redis } from './redis';
+import { adminWrites, authenticate } from './auth';
+import { authRouter } from './routes/auth';
+import { simulatorRouter } from './routes/simulator';
 import { alertsRouter } from './routes/alerts';
 import { anomalyRouter } from './routes/anomaly';
 import { dashboardRouter } from './routes/dashboard';
@@ -29,9 +32,14 @@ export function createApp() {
     res.status(db === 'up' && cache === 'up' ? 200 : 503).json({ status: db === 'up' && cache === 'up' ? 'ok' : 'degraded', postgres: db, redis: cache, simulator: config.simulator });
   });
 
+  // public: auth + device ingest (device keys). Everything below needs a signed-in user; writes need an admin.
+  app.use('/api/auth', authRouter);
+  app.use('/api/telemetry', telemetryRouter);
+  app.use('/api', authenticate, adminWrites);
+
   app.use('/api/dashboard', dashboardRouter);
   app.use('/api/devices', devicesRouter);
-  app.use('/api/telemetry', telemetryRouter);
+  app.use('/api/simulator', simulatorRouter);
   app.use('/api/alerts', alertsRouter);
   app.use('/api/firmware', firmwareRouter);
   app.use('/api/incidents', incidentsRouter);

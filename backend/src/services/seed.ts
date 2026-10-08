@@ -1,7 +1,7 @@
-import crypto from 'crypto';
 import { config } from '../config';
 import { pool, q, q1 } from '../db';
 import { keys, RECENT_MAX, redis } from '../redis';
+import { hashKey, newDeviceKey } from '../util';
 import { newState, reading } from './simulator';
 
 const DEVICES: [string, string, string, string][] = [
@@ -67,9 +67,9 @@ export async function seedIfEmpty() {
   const ids: { id: string; type: string }[] = [];
   for (const [i, [name, type, location, fw]] of DEVICES.entries()) {
     const row = await q1<{ id: string }>(
-      `INSERT INTO devices (name, type, location, ip_address, firmware_version, api_key, simulated)
+      `INSERT INTO devices (name, type, location, ip_address, firmware_version, api_key_hash, simulated)
        VALUES ($1,$2,$3,$4,$5,$6,TRUE) RETURNING id`,
-      [name, type, location, `10.20.${Math.floor(i / 4)}.${10 + i}`, fw, crypto.randomBytes(16).toString('hex')],
+      [name, type, location, `10.20.${Math.floor(i / 4)}.${10 + i}`, fw, hashKey(newDeviceKey())],
     );
     ids.push({ id: row!.id, type });
   }

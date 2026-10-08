@@ -6,13 +6,15 @@ import { asyncH, HttpError } from '../util';
 export const alertsRouter = Router();
 
 alertsRouter.get('/', asyncH(async (req, res) => {
-  const { status, severity, type } = req.query as Record<string, string | undefined>;
+  const { status, severity, type, deviceId, rangeSec } = req.query as Record<string, string | undefined>;
   const where: string[] = [];
   const params: unknown[] = [];
   if (status === 'active') where.push(`a.status <> 'resolved'`);
   else if (status) { params.push(status); where.push(`a.status = $${params.length}`); }
   if (severity) { params.push(severity); where.push(`a.severity = $${params.length}`); }
   if (type) { params.push(type); where.push(`a.type = $${params.length}`); }
+  if (deviceId) { params.push(deviceId); where.push(`a.device_id = $${params.length}`); }
+  if (rangeSec) { params.push(Number(rangeSec)); where.push(`(a.status <> 'resolved' OR a.resolved_at > now() - make_interval(secs => $${params.length}::float8))`); }
   res.json(await q(
     `SELECT a.*, d.name AS device_name, d.type AS device_type FROM alerts a JOIN devices d ON d.id=a.device_id
      ${where.length ? 'WHERE ' + where.join(' AND ') : ''}

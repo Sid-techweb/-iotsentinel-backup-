@@ -26,6 +26,7 @@ services:
       DATABASE_URL: postgres://iot:iot@postgres:5432/iotmonitor
       REDIS_URL: redis://redis:6379
       SIMULATOR: "true"
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
     ports: ["4000:4000"]
     depends_on:
       postgres: { condition: service_healthy }

@@ -3,6 +3,7 @@ import { Check, Eye } from 'lucide-react';
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Alert, api, METRIC_META, useLive } from '../api';
+import { useAuth } from '../auth';
 import { timeAgo } from '../format';
 import { Badge, Card, Empty, PageHead, SeverityBadge, toast } from '../components/ui';
 
@@ -11,6 +12,7 @@ const TYPE_TONE = { predictive: 'pred', threshold: 'warn', heartbeat: 'crit' } a
 
 export default function Alerts() {
   const qc = useQueryClient();
+  const { isAdmin } = useAuth();
   const [status, setStatus] = useState('active');
   const [type, setType] = useState('');
   const [severity, setSeverity] = useState('');
@@ -51,8 +53,8 @@ export default function Alerts() {
                   <td className="muted nowrap">{timeAgo(a.createdAt)}</td>
                   <td><Badge tone={a.status === 'open' ? 'crit' : a.status === 'acknowledged' ? 'warn' : 'ok'}>{a.status}</Badge></td>
                   <td className="nowrap" style={{ textAlign: 'right' }}>
-                    {a.status === 'open' && <button className="btn sm" onClick={() => act.mutate({ id: a.id, status: 'acknowledged' })}><Eye size={12} />Ack</button>}{' '}
-                    {a.status !== 'resolved' && <button className="btn sm" onClick={() => act.mutate({ id: a.id, status: 'resolved' })}><Check size={12} />Resolve</button>}
+                    {a.status === 'open' && <button className="btn sm" disabled={!isAdmin} onClick={() => act.mutate({ id: a.id, status: 'acknowledged' })}><Eye size={12} />Ack</button>}{' '}
+                    {a.status !== 'resolved' && <button className="btn sm" disabled={!isAdmin} onClick={() => act.mutate({ id: a.id, status: 'resolved' })}><Check size={12} />Resolve</button>}
                   </td>
                 </tr>
               ))}

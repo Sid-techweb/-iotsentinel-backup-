@@ -5,6 +5,7 @@ import { FleetPrediction, Summary, useLive } from '../api';
 import { clock, eta, timeAgo } from '../format';
 import { Badge, Card, Empty, ErrorBox, Kpi, PageHead, RiskBar, SeverityBadge } from '../components/ui';
 import { METRIC_META } from '../api';
+import SimulatorControl from '../components/SimulatorControl';
 
 const STATUS_COLORS = { online: 'var(--ok)', degraded: 'var(--warn)', offline: 'var(--off)' };
 
@@ -110,6 +111,8 @@ export default function Dashboard() {
               </div>
             </div>
           </Card>
+
+          <SimulatorControl />
 
           <Card title="Live activity" sub="Newest alerts and security events" flush>
             <ul className="feed">

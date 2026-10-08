@@ -84,11 +84,11 @@ function advanceFault(s: SimState) {
   }
 }
 
-async function startFault(s: SimState) {
-  if (Math.random() < 0.15) { s.offlineTicks = 8 + Math.floor(rand(0, 6)); return; }
+async function startFault(s: SimState, forced?: MetricKey, noOutage = false) {
+  if (!noOutage && Math.random() < 0.15) { s.offlineTicks = 8 + Math.floor(rand(0, 6)); return; }
   const base = BASELINES[s.type] ?? BASELINES['Smart Sensor'];
   const choices = METRIC_KEYS.filter((k) => base[k] !== null);
-  const metric = pick(choices);
+  const metric = forced && choices.includes(forced) ? forced : pick(choices);
   const { dir, range } = METRICS[metric];
   const rules = (await getRules()).filter((r) => r.metric === metric && r.enabled);
   const warn = rules.find((r) => r.severity === 'warning') ?? rules[0];
@@ -111,10 +111,23 @@ const TEMPLATES: { category: (typeof INCIDENT_CATEGORIES)[number]; severity: Sev
   { category: 'Malformed / replayed packets', severity: 'medium', text: () => `${Math.floor(rand(12, 60))} replayed MQTT frames dropped in the last minute` },
 ];
 
-export function startSimulator() {
-  const sims = new Map<string, SimState>();
+const sims = new Map<string, SimState>();
+let paused = false;
 
+export const simulatorStatus = () => ({ running: !paused, devices: sims.size, activeFaults: [...sims.values()].filter((s) => s.fault || s.offlineTicks > 0).length });
+export const setSimulatorPaused = (v: boolean) => { paused = v; };
+
+/** Force a degradation on one simulated device so the predictor can be demonstrated on demand. */
+export async function injectFault(deviceId: string, metric?: MetricKey): Promise<boolean> {
+  const s = sims.get(deviceId);
+  if (!s || s.fault) return false;
+  await startFault(s, metric, true);
+  return !!s.fault;
+}
+
+export function startSimulator() {
   const tick = async () => {
+    if (paused) return;
     try {
       const devs = await q<{ id: string; type: string }>('SELECT id, type FROM devices WHERE simulated');
       for (const d of devs) if (!sims.has(d.id)) sims.set(d.id, newState(d.id, d.type));

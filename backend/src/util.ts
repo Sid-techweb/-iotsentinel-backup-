@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { NextFunction, Request, RequestHandler, Response } from 'express';
 
 export class HttpError extends Error {
@@ -35,3 +36,7 @@ export function compareVersions(a: string, b: string): number {
 export const rand = (min: number, max: number) => min + Math.random() * (max - min);
 export const pick = <T>(arr: readonly T[]): T => arr[Math.floor(Math.random() * arr.length)];
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Device keys are random 128-bit values, so a fast SHA-256 is enough and keeps ingest lookups O(1). */
+export const hashKey = (key: string) => crypto.createHash('sha256').update(key).digest('hex');
+export const newDeviceKey = () => crypto.randomBytes(16).toString('hex');

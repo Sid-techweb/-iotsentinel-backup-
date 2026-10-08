@@ -10,5 +10,7 @@ export const config = {
   simIntervalMs,
   // A device is declared offline when no heartbeat arrived for this long.
   offlineAfterMs: Number(process.env.OFFLINE_AFTER_MS ?? simIntervalMs * 6),
+  jwtSecret: process.env.JWT_SECRET ?? 'dev-secret-change-me',
+  retentionDays: Number(process.env.TELEMETRY_RETENTION_DAYS ?? 7),
   corsOrigin: process.env.CORS_ORIGIN ?? '*',
 };

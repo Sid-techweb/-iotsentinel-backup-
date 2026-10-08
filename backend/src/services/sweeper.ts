@@ -26,5 +26,9 @@ export function startSweeper() {
       console.error('[sweeper]', err);
     }
   };
+  // keep the telemetry table bounded
+  const purge = () => q(`DELETE FROM telemetry WHERE ts < now() - make_interval(days => $1::int)`, [config.retentionDays]).catch((e) => console.error('[retention]', e));
+  purge();
+  setInterval(purge, 3600_000).unref();
   return setInterval(run, Math.max(1000, config.offlineAfterMs / 4));
 }

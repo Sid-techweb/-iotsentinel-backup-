@@ -3,6 +3,7 @@ import { Copy, Plus, Search } from 'lucide-react';
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api, Device, DEVICE_TYPES, useLive } from '../api';
+import { useAuth } from '../auth';
 import { fmtMetric, timeAgo } from '../format';
 import { Badge, Card, Empty, ErrorBox, Modal, PageHead, StatusBadge, toast } from '../components/ui';
 
@@ -10,6 +11,7 @@ const FILTERS = ['all', 'online', 'degraded', 'offline'] as const;
 
 export default function Devices() {
   const nav = useNavigate();
+  const { isAdmin } = useAuth();
   const [filter, setFilter] = useState<(typeof FILTERS)[number]>('all');
   const [search, setSearch] = useState('');
   const [adding, setAdding] = useState(false);
@@ -22,7 +24,7 @@ export default function Devices() {
   return (
     <>
       <PageHead title="Devices" desc="Central inventory with live connectivity and the latest readings.">
-        <button className="btn primary" onClick={() => setAdding(true)}><Plus size={15} />Register device</button>
+        <button className="btn primary" disabled={!isAdmin} title={isAdmin ? undefined : 'Read-only account'} onClick={() => setAdding(true)}><Plus size={15} />Register device</button>
       </PageHead>
 
       <div className="row" style={{ marginBottom: 14, justifyContent: 'space-between' }}>

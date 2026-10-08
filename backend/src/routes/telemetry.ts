@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { q1 } from '../db';
 import { ingest } from '../services/ingest';
-import { asyncH, HttpError } from '../util';
+import { asyncH, HttpError, hashKey } from '../util';
 
 /** Device-facing ingest API, authenticated with the per-device key (x-api-key). */
 export const telemetryRouter = Router();
@@ -18,7 +18,7 @@ const bodySchema = z.object({
 
 async function authDevice(key: unknown) {
   if (typeof key !== 'string' || !key) throw new HttpError(401, 'Missing x-api-key header');
-  const dev = await q1<{ id: string }>('SELECT id FROM devices WHERE api_key=$1', [key]);
+  const dev = await q1<{ id: string }>('SELECT id FROM devices WHERE api_key_hash=$1', [hashKey(key)]);
   if (!dev) throw new HttpError(401, 'Unknown device key');
   return dev.id;
 }

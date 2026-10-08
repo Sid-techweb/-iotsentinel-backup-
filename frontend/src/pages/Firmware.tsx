@@ -1,11 +1,13 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Rocket, ShieldCheck } from 'lucide-react';
 import { Compliance, FwUpdate, Release, api, useLive } from '../api';
+import { useAuth } from '../auth';
 import { timeAgo } from '../format';
 import { Badge, Card, Empty, Kpi, PageHead, StatusBadge, toast } from '../components/ui';
 
 export default function Firmware() {
   const qc = useQueryClient();
+  const { isAdmin } = useAuth();
   const { data: comp } = useLive<Compliance[]>('/firmware/compliance', 4000);
   const { data: releases } = useLive<Release[]>('/firmware/releases', 8000);
   const { data: updates } = useLive<FwUpdate[]>('/firmware/updates', 1500);
@@ -28,7 +30,7 @@ export default function Firmware() {
   return (
     <>
       <PageHead title="Firmware" desc="Track installed versions against the latest release and roll updates out under control.">
-        <button className="btn primary" disabled={!outdated.length || bulk.isPending} onClick={() => bulk.mutate()}><Rocket size={15} />Update all outdated ({outdated.length})</button>
+        <button className="btn primary" disabled={!isAdmin || !outdated.length || bulk.isPending} onClick={() => bulk.mutate()}><Rocket size={15} />Update all outdated ({outdated.length})</button>
       </PageHead>
 
       <div className="grid kpis">
@@ -54,7 +56,7 @@ export default function Firmware() {
                   <td className="mono">{c.latest ?? '-'} {c.missedSecurityReleases > 0 && <Badge tone="warn">{c.missedSecurityReleases} security</Badge>}</td>
                   <td style={{ textAlign: 'right' }}>
                     {c.outdated
-                      ? <button className="btn sm" disabled={c.status === 'offline' || busy.has(c.id) || push.isPending} onClick={() => push.mutate(c.id)}>{busy.has(c.id) ? 'Updating…' : 'Update'}</button>
+                      ? <button className="btn sm" disabled={!isAdmin || c.status === 'offline' || busy.has(c.id) || push.isPending} onClick={() => push.mutate(c.id)}>{busy.has(c.id) ? 'Updating…' : 'Update'}</button>
                       : <Badge tone="ok">current</Badge>}
                   </td>
                 </tr>

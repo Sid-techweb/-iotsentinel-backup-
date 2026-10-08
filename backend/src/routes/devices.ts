@@ -1,9 +1,8 @@
-import crypto from 'crypto';
 import { Router } from 'express';
 import { z } from 'zod';
 import { q, q1 } from '../db';
 import { keys, redis } from '../redis';
-import { asyncH, compareVersions, HttpError } from '../util';
+import { asyncH, compareVersions, hashKey, HttpError, newDeviceKey } from '../util';
 
 export const DEVICE_TYPES = ['Smart Sensor', 'Asset Tracker', 'Gateway', 'IP Camera', 'Smart Meter', 'Industrial Controller'] as const;
 
@@ -47,21 +46,29 @@ devicesRouter.post('/', asyncH(async (req, res) => {
   const b = createSchema.parse(req.body);
   const dup = await q1('SELECT 1 FROM devices WHERE name=$1', [b.name]);
   if (dup) throw new HttpError(409, `A device named "${b.name}" already exists`);
+  const apiKey = newDeviceKey();
   const row = await q1(
-    `INSERT INTO devices (name, type, location, ip_address, firmware_version, api_key, simulated)
+    `INSERT INTO devices (name, type, location, ip_address, firmware_version, api_key_hash, simulated)
      VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
-    [b.name, b.type, b.location, b.ipAddress ?? null, b.firmwareVersion, crypto.randomBytes(16).toString('hex'), b.simulated],
+    [b.name, b.type, b.location, b.ipAddress ?? null, b.firmwareVersion, hashKey(apiKey), b.simulated],
   );
   const [created] = await q(`${LIST_SQL} WHERE d.id=$1`, [row.id]);
-  const key = await q1('SELECT api_key FROM devices WHERE id=$1', [row.id]);
-  res.status(201).json({ ...(await withLatest([created]))[0], apiKey: key.apiKey });
+  // the raw key is returned exactly once - only its hash is stored
+  res.status(201).json({ ...(await withLatest([created]))[0], apiKey });
 }));
 
 devicesRouter.get('/:id', asyncH(async (req, res) => {
   const rows = await q(`${LIST_SQL} WHERE d.id=$1`, [req.params.id]).catch(() => []);
   if (!rows.length) throw new HttpError(404, 'Device not found');
-  const key = await q1('SELECT api_key FROM devices WHERE id=$1', [req.params.id]);
-  res.json({ ...(await withLatest(rows))[0], apiKey: key.apiKey });
+  res.json((await withLatest(rows))[0]);
+}));
+
+/** Issue a new device key. The old one stops working immediately; the new one is shown once. */
+devicesRouter.post('/:id/key', asyncH(async (req, res) => {
+  const apiKey = newDeviceKey();
+  const rows = await q('UPDATE devices SET api_key_hash=$2 WHERE id=$1 RETURNING id', [req.params.id, hashKey(apiKey)]);
+  if (!rows.length) throw new HttpError(404, 'Device not found');
+  res.json({ apiKey });
 }));
 
 devicesRouter.delete('/:id', asyncH(async (req, res) => {
@@ -88,4 +95,26 @@ devicesRouter.get('/:id/history', asyncH(async (req, res) => {
     q(`SELECT * FROM firmware_updates WHERE device_id=$1 ORDER BY created_at DESC LIMIT 5`, [req.params.id]),
   ]);
   res.json({ alerts, incidents, updates });
+}));
+
+const RANGE_SECONDS: Record<string, number> = { '15m': 900, '1h': 3600, '6h': 21600, '24h': 86400 };
+
+/** Averaged history for the Activity workspace (about 150 points whatever the range). */
+devicesRouter.get('/:id/readings', asyncH(async (req, res) => {
+  const range = String(req.query.range ?? '1h');
+  const secs = RANGE_SECONDS[range];
+  if (!secs) throw new HttpError(400, 'range must be one of 15m, 1h, 6h, 24h');
+  const bucket = Math.max(2, Math.ceil(secs / 150));
+  res.json({
+    rangeSeconds: secs,
+    bucketSeconds: bucket,
+    points: await q(
+      `SELECT to_timestamp(floor(extract(epoch FROM ts) / $2::float8) * $2::float8) AS ts,
+         avg(temperature)::real AS temperature, avg(cpu)::real AS cpu, avg(memory)::real AS memory,
+         avg(battery)::real AS battery, avg(signal)::real AS signal
+       FROM telemetry WHERE device_id=$1 AND ts > now() - make_interval(secs => $3::float8)
+       GROUP BY 1 ORDER BY 1`,
+      [req.params.id, bucket, secs],
+    ),
+  });
 }));

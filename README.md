@@ -17,6 +17,8 @@ docker compose up -d --build      # postgres + redis + backend + frontend
 | REST API  | http://localhost:4000/api    |
 | Postgres  | localhost:5433 (iot / iot)   |
 
+**First run:** open the dashboard and choose *Create an account*. The first account on a fresh installation becomes the **administrator**; later sign-ups are read-only viewers.
+
 On first boot the backend creates the schema, seeds a 14-device demo fleet (with 100 readings of history each) and
 starts the **device simulator**, so the dashboard is live immediately.
 
@@ -41,6 +43,10 @@ React + TypeScript dashboard ◄──── REST API (polling)
 * **Rule-based alerts** - configurable warning/critical thresholds per metric (Alert Rules page).
 * **Firmware tracking** - releases per device type, per-device compliance, controlled (simulated) rollouts. An old version is shown as a *maintenance signal*, never as proof of a vulnerability.
 * **Security incidents** - consolidated queue with severity, category, status workflow and summaries.
+* **Authentication & roles** - JWT sign-in, bcrypt-hashed passwords, admin (read/write) and viewer (read-only) roles, login rate-limiting in Redis.
+* **Device keys** - shown once at registration, stored only as a SHA-256 hash, rotatable from the device page.
+* **Activity workspace** - per-device history charts with limit lines, an alert lifecycle timeline (started → active → resolved) and raw readings with CSV export.
+* **Simulator controls** - pause the fleet or trigger a fault on demand to demo missed-heartbeat detection and the predictor.
 * **Anomaly prediction** - see below.
 
 ## Anomaly prediction model
@@ -59,9 +65,12 @@ Limitation: it is trained on synthetic data - the next phase retrains on real te
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/api/telemetry`, `/api/telemetry/heartbeat` | Device ingest (`x-api-key` header) |
+| POST | `/api/auth/register`, `/login` · GET/PATCH `/me` · POST `/me/password` | Accounts and sessions (Bearer JWT) |
+| POST | `/api/telemetry`, `/api/telemetry/heartbeat` | Device ingest (`x-api-key` header, no user login) |
 | GET/POST/DELETE | `/api/devices`, `/api/devices/:id` | Inventory |
-| GET | `/api/devices/:id/telemetry`, `/history` | Readings; alerts/incidents/updates for a device |
+| GET | `/api/devices/:id/telemetry`, `/readings?range=`, `/history` | Raw / averaged readings; alerts, incidents and updates for a device |
+| POST | `/api/devices/:id/key` | Rotate a device key (returned once) |
+| GET/POST | `/api/simulator`, `/pause`, `/resume`, `/inject-fault` | Demo controls |
 | GET/PATCH | `/api/alerts` | List, acknowledge, resolve |
 | GET/PUT | `/api/rules` | Threshold configuration |
 | GET/POST | `/api/firmware/releases`, `/compliance`, `/updates`, `/updates/bulk` | Firmware management |
@@ -72,18 +81,23 @@ Limitation: it is trained on synthetic data - the next phase retrains on real te
 Send telemetry from a real device:
 
 ```bash
-curl -X POST http://localhost:4000/api/telemetry -H "x-api-key: <device key>" \
+curl -X POST http://localhost:4000/api/telemetry -H "x-api-key: <key shown at registration>" \
   -H "Content-Type: application/json" -d '{"temperature":41.5,"cpu":22,"memory":48}'
 ```
 
-## Review 1 status (~40 %)
+## Status (~40 %+)
 
-**Done:** full React + TypeScript frontend (8 screens), REST API, PostgreSQL schema + seed, Redis integration,
-device simulator, rule-based alerts, missed-heartbeat detection, firmware tracking + simulated updates,
-incident logging/reporting, anomaly-prediction model with forecast UI, Dockerised stack.
+**Done:** React + TypeScript frontend (10 screens incl. sign-in, Activity and Account, mobile bottom navigation),
+REST API, JWT authentication with roles, hashed device keys, PostgreSQL schema + seed, Redis integration, device simulator
+with demo controls, rule-based alerts, missed-heartbeat detection, firmware tracking + simulated updates, incident
+logging/reporting, anomaly-prediction model with forecast UI, telemetry retention, Dockerised stack.
 
-**Remaining (~60 %):** user authentication & roles (JWT), per-device key rotation, WebSocket/SSE push instead of polling,
-email/webhook notifications, automated tests + CI (GitHub Actions), retraining the model on real telemetry,
-telemetry retention/aggregation, PDF/CSV incident reports, production hardening (rate limiting, HTTPS).
+**Remaining:** WebSocket/SSE push instead of polling, email/webhook notifications, automated tests + CI (GitHub Actions),
+retraining the model on real telemetry, user management screen (promote viewers), PDF/CSV incident reports,
+HTTPS and production hardening.
 
-> The API is currently unauthenticated apart from device keys - intentional for this milestone, first item for the next one.
+## Design inspiration
+
+The sign-in flow, one-time device keys, separate Activity workspace (history vs. live monitoring), simulator controls and
+mobile bottom navigation were inspired by the UX of [Merouanos/arduino-IoT](https://github.com/Merouanos/arduino-IoT).
+No code was copied - everything here is implemented independently for this project's domain and stack.

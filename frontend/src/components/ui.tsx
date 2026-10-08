@@ -1,5 +1,6 @@
 import { ReactNode, useEffect, useState } from 'react';
 import { X } from 'lucide-react';
+import Flash from './Flash';
 import { IncidentSeverity, RiskLevel, Severity, Status } from '../api';
 
 type Tone = 'ok' | 'warn' | 'crit' | 'info' | 'pred' | 'accent' | '';
@@ -43,7 +44,7 @@ export function Kpi({ label, value, note, tone = '', icon }: { label: string; va
   return (
     <div className={`card kpi tone-${tone}`}>
       <div className="label">{icon}{label}</div>
-      <div className="value">{value}</div>
+      <div className="value"><Flash value={value}>{value}</Flash></div>
       {note && <div className="note">{note}</div>}
     </div>
   );

@@ -74,7 +74,8 @@ export interface IncidentSummary {
 export interface TelemetryRow extends Reading { ts: string }
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`/api${path}`, { headers: { 'Content-Type': 'application/json' }, ...init });
+  const res = await fetch(`/api${path}`, { headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) }, ...init });
+  if (res.status === 401 && !path.startsWith('/auth/login') && !path.startsWith('/auth/register')) onUnauthorized?.();
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new Error(body.error ?? `${res.status} ${res.statusText}`);
@@ -100,3 +101,20 @@ export function useLive<T>(path: string, interval: number | false = 3000, enable
     placeholderData: (prev) => prev,
   });
 }
+
+/* ---------- auth + simulator + history types ---------- */
+export interface User { id: string; email: string; name: string; role: 'admin' | 'viewer' }
+export interface SimStatus { enabled: boolean; running: boolean; devices: number; activeFaults: number }
+export interface Readings { rangeSeconds: number; bucketSeconds: number; points: (Reading & { ts: string })[] }
+
+const TOKEN_KEY = 'iot-token';
+let token: string | null = null;
+let onUnauthorized: (() => void) | null = null;
+try { token = localStorage.getItem(TOKEN_KEY); } catch { /* storage unavailable */ }
+
+export const getToken = () => token;
+export function setToken(t: string | null) {
+  token = t;
+  try { t ? localStorage.setItem(TOKEN_KEY, t) : localStorage.removeItem(TOKEN_KEY); } catch { /* storage unavailable */ }
+}
+export const setUnauthorizedHandler = (fn: (() => void) | null) => { onUnauthorized = fn; };
