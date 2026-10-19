@@ -1,35 +1,38 @@
 import { config } from '../config';
 import { q } from '../db';
-import { METRIC_KEYS, METRICS, MetricKey, Metrics } from '../ml/metrics';
+import { emptyMetrics, METRIC_KEYS, METRICS, MetricKey } from '../ml/metrics';
 import { ALERT_PROB } from '../ml/model';
 import { keys, RECENT_MAX, redis } from '../redis';
 import { clearAlerts, raiseAlert } from './alerts';
+import { deviceTypeOf } from './deviceTypes';
+import { publishTick } from './events';
 import { predictDevice } from './prediction';
-import { getRules } from './rules';
+import { recordPredictions } from './predictionHistory';
+import { rulesForType } from './rules';
 
 export type MetricInput = Partial<Record<MetricKey, number | null>>;
 
 const fmtEta = (s: number) => (s < 90 ? `${Math.round(s)}s` : `${(s / 60).toFixed(1)} min`);
+
+const INSERT_SQL = `INSERT INTO telemetry (device_id, ts, ${METRIC_KEYS.join(', ')}) VALUES ($1, $2, ${METRIC_KEYS.map((_, i) => `$${i + 3}`).join(', ')})`;
 
 /**
  * Single entry point for every heartbeat / telemetry reading, whether it comes from
  * the REST API (real device) or the built-in simulator:
  *   1. persist the reading            (PostgreSQL)
  *   2. refresh liveness + hot state   (Redis)
- *   3. evaluate threshold rules       -> threshold alerts
+ *   3. evaluate threshold rules       -> threshold alerts (limits of the device's machine type)
  *   4. run the anomaly predictor      -> predictive alerts (before the breach)
  *   5. recompute device status
  */
 export async function ingest(deviceId: string, input: MetricInput = {}, ts = new Date()) {
-  const m: Metrics = { temperature: null, cpu: null, memory: null, battery: null, signal: null };
+  const m = emptyMetrics();
   for (const k of METRIC_KEYS) m[k] = input[k] ?? null;
   const hasMetrics = METRIC_KEYS.some((k) => m[k] !== null);
+  const type = await deviceTypeOf(deviceId);
 
   if (hasMetrics) {
-    await q(
-      `INSERT INTO telemetry (device_id, ts, temperature, cpu, memory, battery, signal) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [deviceId, ts, m.temperature, m.cpu, m.memory, m.battery, m.signal],
-    );
+    await q(INSERT_SQL, [deviceId, ts, ...METRIC_KEYS.map((k) => m[k])]);
     const point = JSON.stringify({ ts: ts.getTime(), ...m });
     await redis
       .multi()
@@ -47,7 +50,7 @@ export async function ingest(deviceId: string, input: MetricInput = {}, ts = new
 
   // ---- rule-based threshold alerts ----
   if (hasMetrics) {
-    const rules = await getRules();
+    const rules = await rulesForType(type);
     for (const key of METRIC_KEYS) {
       const v = m[key];
       if (v === null) continue;
@@ -66,7 +69,8 @@ export async function ingest(deviceId: string, input: MetricInput = {}, ts = new
     }
 
     // ---- predictive alerts: warn BEFORE the threshold is crossed ----
-    const { prediction } = await predictDevice(deviceId);
+    const { prediction } = await predictDevice(deviceId, type);
+    recordPredictions(deviceId, prediction.metrics).catch((e) => console.error('[prediction-history]', e.message));
     for (const f of prediction.metrics) {
       if (f.breached) {
         await clearAlerts(deviceId, 'predictive', f.metric);
@@ -82,4 +86,5 @@ export async function ingest(deviceId: string, input: MetricInput = {}, ts = new
   }
 
   await q(`UPDATE devices SET last_seen=$2, status=$3 WHERE id=$1`, [deviceId, ts, degraded ? 'degraded' : 'online']);
+  publishTick();
 }

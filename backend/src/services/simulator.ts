@@ -1,31 +1,29 @@
 import { config } from '../config';
 import { q } from '../db';
-import { METRIC_KEYS, METRICS, MetricKey, Metrics } from '../ml/metrics';
+import { emptyMetrics, METRIC_KEYS, METRICS, MetricKey, Metrics } from '../ml/metrics';
 import { pick, rand } from '../util';
+import { baselinesFor } from './deviceTypes';
 import { createIncident, INCIDENT_CATEGORIES, Severity } from './incidents';
 import { ingest } from './ingest';
-import { getRules } from './rules';
+import { rulesForType } from './rules';
 
 /**
  * Fleet simulator (the "IoT devices / simulator" box in the architecture).
  * Every tick each simulated device reports telemetry through the same ingest
- * pipeline a real device would use. Healthy devices wobble around a baseline;
- * every so often a device starts a slow fault (overheating, memory leak, battery
- * drain, weak signal) so the predictor has real degradation to catch, or drops
- * offline to exercise missed-heartbeat detection.
+ * pipeline a real device would use, but only the signals its machine type has.
+ * Healthy devices wobble around a baseline; every so often a device starts a slow
+ * fault (overheating, memory leak, battery drain, weak signal, bearing vibration...)
+ * so the predictor has real degradation to catch, or drops offline to exercise
+ * missed-heartbeat detection.
  */
 
-export const BASELINES: Record<string, Metrics> = {
-  'Smart Sensor': { temperature: 28, cpu: 18, memory: 42, battery: 85, signal: -58 },
-  'Asset Tracker': { temperature: 30, cpu: 20, memory: 40, battery: 78, signal: -66 },
-  Gateway: { temperature: 46, cpu: 34, memory: 55, battery: null, signal: -50 },
-  'IP Camera': { temperature: 50, cpu: 45, memory: 60, battery: null, signal: -55 },
-  'Smart Meter': { temperature: 35, cpu: 15, memory: 38, battery: null, signal: -62 },
-  'Industrial Controller': { temperature: 52, cpu: 40, memory: 58, battery: null, signal: -52 },
-};
+export type Baseline = Partial<Record<MetricKey, number>>;
 
-const NOISE: Record<MetricKey, number> = { temperature: 0.5, cpu: 2, memory: 0.8, battery: 0.05, signal: 1.2 };
-const WANDER: Record<MetricKey, number> = { temperature: 1.5, cpu: 3, memory: 1.5, battery: 0, signal: 2 };
+const NOISE: Record<MetricKey, number> = { temperature: 0.5, cpu: 2, memory: 0.8, battery: 0.05, signal: 1.2, vibration: 0.12, pressure: 0.06, current: 0.35 };
+const WANDER: Record<MetricKey, number> = { temperature: 1.5, cpu: 3, memory: 1.5, battery: 0, signal: 2, vibration: 0.25, pressure: 0.15, current: 0.7 };
+const CLAMP: Record<MetricKey, [number, number]> = {
+  temperature: [-20, 150], cpu: [0, 100], memory: [0, 100], battery: [0, 100], signal: [-120, -20], vibration: [0, 40], pressure: [0, 20], current: [0, 60],
+};
 
 interface Fault {
   metric: MetricKey;
@@ -39,6 +37,7 @@ interface Fault {
 export interface SimState {
   id: string;
   type: string;
+  base: Baseline;
   tick: number;
   phase: number;
   batteryLevel: number;
@@ -49,22 +48,23 @@ export interface SimState {
 
 const gauss = () => Math.sqrt(-2 * Math.log(1 - Math.random())) * Math.cos(2 * Math.PI * Math.random());
 
-export function newState(id: string, type: string): SimState {
-  const base = BASELINES[type] ?? BASELINES['Smart Sensor'];
-  return { id, type, tick: 0, phase: rand(0, 6.28), batteryLevel: base.battery === null ? 0 : rand(55, 92), offsets: {}, offlineTicks: 0 };
+export function newState(id: string, type: string, base: Baseline): SimState {
+  return { id, type, base, tick: 0, phase: rand(0, 6.28), batteryLevel: base.battery === undefined ? 0 : rand(55, 92), offsets: {}, offlineTicks: 0 };
 }
 
+/** One reading containing only the signals this machine type reports. */
 export function reading(s: SimState): Metrics {
-  const base = BASELINES[s.type] ?? BASELINES['Smart Sensor'];
-  const out: Metrics = { temperature: null, cpu: null, memory: null, battery: null, signal: null };
+  const out = emptyMetrics();
   for (const k of METRIC_KEYS) {
-    if (base[k] === null) continue;
-    const b = k === 'battery' ? s.batteryLevel : (base[k] as number);
+    const start = s.base[k];
+    if (start === undefined) continue;
+    const b = k === 'battery' ? s.batteryLevel : start;
     const v = b + WANDER[k] * Math.sin(s.tick / 18 + s.phase) + NOISE[k] * gauss() + (s.offsets[k] ?? 0);
-    out[k] = Math.round(Math.max(k === 'signal' ? -120 : 0, Math.min(k === 'signal' ? -20 : 100, v)) * 100) / 100;
+    const [lo, hi] = CLAMP[k];
+    out[k] = Math.round(Math.max(lo, Math.min(hi, v)) * 100) / 100;
   }
   s.tick++;
-  if (base.battery !== null) s.batteryLevel = Math.max(3, s.batteryLevel - 0.004);
+  if (s.base.battery !== undefined) s.batteryLevel = Math.max(3, s.batteryLevel - 0.004);
   return out;
 }
 
@@ -86,15 +86,15 @@ function advanceFault(s: SimState) {
 
 async function startFault(s: SimState, forced?: MetricKey, noOutage = false) {
   if (!noOutage && Math.random() < 0.15) { s.offlineTicks = 8 + Math.floor(rand(0, 6)); return; }
-  const base = BASELINES[s.type] ?? BASELINES['Smart Sensor'];
-  const choices = METRIC_KEYS.filter((k) => base[k] !== null);
+  const choices = METRIC_KEYS.filter((k) => s.base[k] !== undefined);
+  if (!choices.length) return;
   const metric = forced && choices.includes(forced) ? forced : pick(choices);
   const { dir, range } = METRICS[metric];
-  const rules = (await getRules()).filter((r) => r.metric === metric && r.enabled);
+  const rules = (await rulesForType(s.type)).filter((r) => r.metric === metric && r.enabled);
   const warn = rules.find((r) => r.severity === 'warning') ?? rules[0];
   const crit = rules.find((r) => r.severity === 'critical');
   if (!warn) return;
-  const start = metric === 'battery' ? s.batteryLevel : (base[metric] as number);
+  const start = metric === 'battery' ? s.batteryLevel : (s.base[metric] as number);
   const goCritical = crit !== undefined && Math.random() < 0.3;
   const target = (goCritical ? crit!.threshold : warn.threshold);
   const distance = Math.abs(target - start) + range * 0.05;
@@ -125,12 +125,17 @@ export async function injectFault(deviceId: string, metric?: MetricKey): Promise
   return !!s.fault;
 }
 
+async function ensureState(d: { id: string; type: string }) {
+  if (!sims.has(d.id)) sims.set(d.id, newState(d.id, d.type, await baselinesFor(d.type)));
+  return sims.get(d.id)!;
+}
+
 export function startSimulator() {
   const tick = async () => {
     if (paused) return;
     try {
-      const devs = await q<{ id: string; type: string }>('SELECT id, type FROM devices WHERE simulated');
-      for (const d of devs) if (!sims.has(d.id)) sims.set(d.id, newState(d.id, d.type));
+      const devs = await q<{ id: string; type: string }>('SELECT id, type FROM devices WHERE simulated AND active');
+      for (const d of devs) await ensureState(d);
       for (const id of sims.keys()) if (!devs.find((d) => d.id === id)) sims.delete(id);
 
       const list = [...sims.values()];
@@ -159,10 +164,11 @@ export function startSimulator() {
 
   // kick off two faults shortly after boot so the demo has something to predict
   setTimeout(async () => {
-    const devs = await q<{ id: string; type: string }>('SELECT id, type FROM devices WHERE simulated ORDER BY random() LIMIT 2');
-    for (const d of devs) {
-      if (!sims.has(d.id)) sims.set(d.id, newState(d.id, d.type));
-      await startFault(sims.get(d.id)!);
+    try {
+      const devs = await q<{ id: string; type: string }>('SELECT id, type FROM devices WHERE simulated AND active ORDER BY random() LIMIT 2');
+      for (const d of devs) await startFault(await ensureState(d));
+    } catch (e) {
+      console.error('[sim]', e);
     }
   }, config.simIntervalMs * 2);
 

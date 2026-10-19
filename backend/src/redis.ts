@@ -19,6 +19,12 @@ export const keys = {
   recent: (id: string) => `recent:${id}`,
 };
 
+/** Drop cached responses whose key starts with `prefix` (e.g. when devices change, so the dashboard updates at once). */
+export async function clearCache(prefix: string) {
+  const found = await redis.keys(`${prefix}*`);
+  if (found.length) await redis.del(...found);
+}
+
 export async function cached<T>(key: string, ttlMs: number, load: () => Promise<T>): Promise<T> {
   const hit = await redis.get(key);
   if (hit) return JSON.parse(hit) as T;

@@ -44,4 +44,9 @@ export const adminWrites: RequestHandler = (req, _res, next) => {
   next();
 };
 
-if (config.jwtSecret === 'dev-secret-change-me') console.warn('[auth] JWT_SECRET not set - using an insecure development secret');
+/** Admin-only guard for reads as well as writes, for screens that expose secrets or user data. */
+export const requireAdmin: RequestHandler = (req, _res, next) => {
+  if (req.user?.role !== 'admin') return next(new HttpError(403, 'Administrator access required'));
+  next();
+};
+

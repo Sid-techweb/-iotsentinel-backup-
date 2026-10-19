@@ -111,6 +111,7 @@ function Lifecycle({ deviceId, rangeSeconds }: { deviceId: string; rangeSeconds:
 function RawReadings({ device }: { device: Device }) {
   const { data } = useLive<TelemetryRow[]>(`/devices/${device.id}/telemetry?limit=100`, 5000);
   const rows = [...(data ?? [])].reverse();
+  const shown = METRIC_KEYS.filter((k) => rows.some((r) => r[k] !== null)); // only the signals this machine type reports
 
   const exportCsv = () => {
     const head = ['timestamp', ...METRIC_KEYS].join(',');
@@ -128,12 +129,12 @@ function RawReadings({ device }: { device: Device }) {
       action={<button className="btn sm" onClick={exportCsv} disabled={!rows.length}><Download size={13} />Export CSV</button>}>
       {!rows.length ? <Empty>No readings.</Empty> : (
         <div className="table-wrap" style={{ maxHeight: 340, overflow: 'auto' }}><table>
-          <thead><tr><th>Time</th>{METRIC_KEYS.map((k) => <th key={k} className="num">{METRIC_META[k].label}</th>)}</tr></thead>
+          <thead><tr><th>Time</th>{shown.map((k) => <th key={k} className="num">{METRIC_META[k].label}</th>)}</tr></thead>
           <tbody>
             {rows.map((r) => (
               <tr key={r.ts}>
                 <td className="nowrap muted">{new Date(r.ts).toLocaleTimeString()}</td>
-                {METRIC_KEYS.map((k) => <td key={k} className="num">{fmtMetric(k, r[k])}</td>)}
+                {shown.map((k) => <td key={k} className="num">{fmtMetric(k, r[k])}</td>)}
               </tr>
             ))}
           </tbody>

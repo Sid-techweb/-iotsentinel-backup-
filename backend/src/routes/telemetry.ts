@@ -14,12 +14,16 @@ const bodySchema = z.object({
   memory: num(0, 100),
   battery: num(0, 100),
   signal: num(-130, 0),
+  vibration: num(0, 200),
+  pressure: num(0, 1000),
+  current: num(0, 1000),
 });
 
 async function authDevice(key: unknown) {
   if (typeof key !== 'string' || !key) throw new HttpError(401, 'Missing x-api-key header');
-  const dev = await q1<{ id: string }>('SELECT id FROM devices WHERE api_key_hash=$1', [hashKey(key)]);
+  const dev = await q1<{ id: string; active: boolean }>('SELECT id, active FROM devices WHERE api_key_hash=$1', [hashKey(key)]);
   if (!dev) throw new HttpError(401, 'Unknown device key');
+  if (!dev.active) throw new HttpError(403, 'This device has been deactivated');
   return dev.id;
 }
 

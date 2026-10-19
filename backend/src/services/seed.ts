@@ -1,7 +1,10 @@
 import { config } from '../config';
 import { pool, q, q1 } from '../db';
+import { METRIC_KEYS } from '../ml/metrics';
 import { keys, RECENT_MAX, redis } from '../redis';
 import { hashKey, newDeviceKey } from '../util';
+import { baselinesFor, DEFAULT_TYPES, invalidateDeviceTypes } from './deviceTypes';
+import { invalidateRules } from './rules';
 import { newState, reading } from './simulator';
 
 const DEVICES: [string, string, string, string][] = [
@@ -20,6 +23,10 @@ const DEVICES: [string, string, string, string][] = [
   ['meter-plantB-01', 'Smart Meter', 'Plant B', '1.4.0'],
   ['plc-plantA-01', 'Industrial Controller', 'Plant A', '5.2.0'],
   ['plc-plantB-01', 'Industrial Controller', 'Plant B', '5.1.0'],
+  ['cnc-plantA-01', 'CNC Machine', 'Plant A', '6.1.0'],
+  ['cnc-plantB-01', 'CNC Machine', 'Plant B', '6.0.0'],
+  ['pump-station-01', 'Pump Station', 'Water Plant', '2.1.0'],
+  ['pump-station-02', 'Pump Station', 'Water Plant', '2.0.0'],
 ];
 
 // type -> [version, notes, securityPatch][] oldest -> newest
@@ -30,68 +37,119 @@ const RELEASES: Record<string, [string, string, boolean][]> = {
   'IP Camera': [['4.0.0', 'Initial release', false], ['4.1.0', 'Disables legacy RTSP auth, new codec', true], ['4.2.0', 'Secure boot attestation', true]],
   'Smart Meter': [['1.3.0', 'Initial release', false], ['1.4.0', 'Billing accuracy', false], ['1.5.0', 'Encrypted uplink', true], ['1.6.0', 'Tamper-event reporting', true]],
   'Industrial Controller': [['5.0.0', 'Initial release', false], ['5.1.0', 'Modbus hardening', true], ['5.2.0', 'Scan-cycle jitter fixes', false], ['5.3.0', 'Signed logic downloads', true]],
+  'CNC Machine': [['6.0.0', 'Initial release', false], ['6.1.0', 'Spindle vibration filter', false], ['6.2.0', 'Signed G-code uploads', true]],
+  'Pump Station': [['2.0.0', 'Initial release', false], ['2.1.0', 'Pressure sensor calibration', false], ['2.2.0', 'Hardened remote valve control', true]],
 };
 
+/** Default alert rules for every machine type. */
 const RULES: [string, '>' | '<', number, 'warning' | 'critical'][] = [
   ['temperature', '>', 70, 'warning'], ['temperature', '>', 85, 'critical'],
   ['cpu', '>', 85, 'warning'], ['cpu', '>', 95, 'critical'],
   ['memory', '>', 85, 'warning'], ['memory', '>', 95, 'critical'],
   ['battery', '<', 20, 'warning'], ['battery', '<', 10, 'critical'],
   ['signal', '<', -80, 'warning'], ['signal', '<', -90, 'critical'],
+  ['vibration', '>', 7, 'warning'], ['vibration', '>', 11, 'critical'],
+  ['pressure', '>', 8, 'warning'], ['pressure', '>', 10, 'critical'],
+  ['current', '>', 22, 'warning'], ['current', '>', 28, 'critical'],
+];
+
+/** Machine-specific limits that differ from the defaults. */
+const OVERRIDES: [string, string, '>' | '<', number, 'warning' | 'critical'][] = [
+  ['CNC Machine', 'temperature', '>', 75, 'warning'], ['CNC Machine', 'temperature', '>', 90, 'critical'],
+  ['CNC Machine', 'vibration', '>', 6, 'warning'], ['CNC Machine', 'vibration', '>', 9, 'critical'],
+  ['CNC Machine', 'current', '>', 20, 'warning'], ['CNC Machine', 'current', '>', 26, 'critical'],
+  ['Pump Station', 'pressure', '>', 7.5, 'warning'], ['Pump Station', 'pressure', '>', 9.5, 'critical'],
+  ['Pump Station', 'vibration', '>', 5, 'warning'], ['Pump Station', 'vibration', '>', 8, 'critical'],
 ];
 
 const HISTORY_POINTS = 100;
 
-export async function seedIfEmpty() {
-  const { count } = (await q1<{ count: number }>('SELECT count(*)::int AS count FROM devices'))!;
-  if (count > 0) return;
-  console.log('[seed] empty database - seeding demo fleet');
-
+/**
+ * Idempotent reference data, safe to run on every boot: machine types, default rules,
+ * per-type rule overrides and firmware releases. Returns the machine types added by this run.
+ */
+export async function ensureReferenceData(): Promise<string[]> {
+  const added: string[] = [];
+  for (const t of DEFAULT_TYPES) {
+    const row = await q1<{ name: string }>(
+      `INSERT INTO device_types (name, description, metrics, baselines) VALUES ($1,$2,$3,$4)
+       ON CONFLICT (name) DO NOTHING RETURNING name`,
+      [t.name, t.description, Object.keys(t.baselines), JSON.stringify(t.baselines)],
+    );
+    if (row) added.push(row.name);
+  }
   for (const [metric, op, threshold, severity] of RULES) {
     await q('INSERT INTO rules (metric, operator, threshold, severity) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING', [metric, op, threshold, severity]);
   }
-
+  // overrides are only created together with their machine type, so deleting one later sticks
+  for (const [type, metric, op, threshold, severity] of OVERRIDES) {
+    if (!added.includes(type)) continue;
+    await q('INSERT INTO rules (metric, operator, threshold, severity, device_type) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING', [metric, op, threshold, severity, type]);
+  }
   let month = 4;
   for (const [type, list] of Object.entries(RELEASES)) {
     let i = 0;
     for (const [version, notes, sec] of list) {
       await q(
-        `INSERT INTO firmware_releases (device_type, version, notes, security_patch, released_at) VALUES ($1,$2,$3,$4, now() - ($5 || ' days')::interval)`,
+        `INSERT INTO firmware_releases (device_type, version, notes, security_patch, released_at)
+         VALUES ($1,$2,$3,$4, now() - ($5 || ' days')::interval) ON CONFLICT (device_type, version) DO NOTHING`,
         [type, version, notes, sec, String((list.length - i) * 35 + month)],
       );
       i++;
     }
     month += 3;
   }
+  invalidateRules();
+  invalidateDeviceTypes();
+  return added;
+}
 
-  const ids: { id: string; type: string }[] = [];
-  for (const [i, [name, type, location, fw]] of DEVICES.entries()) {
+/** Recent healthy history so charts and the predictor have data straight away. */
+async function backfill(deviceId: string, type: string) {
+  const st = newState(deviceId, type, await baselinesFor(type));
+  const now = Date.now();
+  const rows: unknown[][] = [];
+  const recent: string[] = [];
+  for (let n = HISTORY_POINTS; n >= 1; n--) {
+    const ts = new Date(now - n * config.simIntervalMs);
+    const m = reading(st);
+    rows.push([deviceId, ts, ...METRIC_KEYS.map((k) => m[k])]);
+    recent.push(JSON.stringify({ ts: ts.getTime(), ...m }));
+  }
+  const width = 2 + METRIC_KEYS.length;
+  const values = rows.map((_, r) => `(${Array.from({ length: width }, (_, c) => `$${r * width + c + 1}`).join(',')})`).join(',');
+  await pool.query(`INSERT INTO telemetry (device_id, ts, ${METRIC_KEYS.join(', ')}) VALUES ${values}`, rows.flat() as any[]);
+  await redis.del(keys.recent(deviceId));
+  await redis.lpush(keys.recent(deviceId), ...recent.slice(-RECENT_MAX)); // oldest first in => newest ends up at head
+  await redis.set(keys.latest(deviceId), recent[recent.length - 1]);
+}
+
+async function addDevices(list: typeof DEVICES) {
+  const created: { id: string; type: string }[] = [];
+  for (const [i, [name, type, location, fw]] of list.entries()) {
     const row = await q1<{ id: string }>(
       `INSERT INTO devices (name, type, location, ip_address, firmware_version, api_key_hash, simulated)
-       VALUES ($1,$2,$3,$4,$5,$6,TRUE) RETURNING id`,
+       VALUES ($1,$2,$3,$4,$5,$6,TRUE) ON CONFLICT (name) DO NOTHING RETURNING id`,
       [name, type, location, `10.20.${Math.floor(i / 4)}.${10 + i}`, fw, hashKey(newDeviceKey())],
     );
-    ids.push({ id: row!.id, type });
+    if (row) { created.push({ id: row.id, type }); await backfill(row.id, type); }
   }
+  return created;
+}
 
-  // Backfill recent healthy history so charts and the predictor have data on first load.
-  const now = Date.now();
-  for (const d of ids) {
-    const st = newState(d.id, d.type);
-    const rows: any[] = [];
-    const recent: string[] = [];
-    for (let n = HISTORY_POINTS; n >= 1; n--) {
-      const ts = new Date(now - n * config.simIntervalMs);
-      const m = reading(st);
-      rows.push([d.id, ts, m.temperature, m.cpu, m.memory, m.battery, m.signal]);
-      recent.push(JSON.stringify({ ts: ts.getTime(), ...m }));
+export async function seedIfEmpty(newTypes: string[] = []) {
+  const { count } = (await q1<{ count: number }>('SELECT count(*)::int AS count FROM devices'))!;
+  if (count > 0) {
+    // an existing installation gains demo machines for any machine type introduced by this upgrade
+    const extra = DEVICES.filter(([, type]) => newTypes.includes(type));
+    if (extra.length) {
+      const created = await addDevices(extra);
+      if (created.length) console.log(`[seed] added ${created.length} demo machines for new machine types`);
     }
-    const values = rows.map((_, i) => `($${i * 7 + 1},$${i * 7 + 2},$${i * 7 + 3},$${i * 7 + 4},$${i * 7 + 5},$${i * 7 + 6},$${i * 7 + 7})`).join(',');
-    await pool.query(`INSERT INTO telemetry (device_id, ts, temperature, cpu, memory, battery, signal) VALUES ${values}`, rows.flat());
-    await redis.del(keys.recent(d.id));
-    await redis.lpush(keys.recent(d.id), ...recent.slice(-RECENT_MAX)); // oldest first in => newest ends up at head
-    await redis.set(keys.latest(d.id), recent[recent.length - 1]);
+    return;
   }
+  console.log('[seed] empty database - seeding demo fleet');
+  const ids = await addDevices(DEVICES);
 
   const hoursAgo = (h: number) => `now() - interval '${h} hours'`;
   const incidents: [number, string, string, string, string, number][] = [
@@ -110,5 +168,5 @@ export async function seedIfEmpty() {
       [ids[di].id, category, severity, description, status],
     );
   }
-  console.log(`[seed] ${DEVICES.length} devices, ${HISTORY_POINTS} readings each`);
+  console.log(`[seed] ${ids.length} devices, ${HISTORY_POINTS} readings each`);
 }

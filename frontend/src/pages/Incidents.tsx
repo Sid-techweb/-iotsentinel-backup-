@@ -1,8 +1,8 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { Plus } from 'lucide-react';
+import { Download, Plus } from 'lucide-react';
 import { useState } from 'react';
 import { Bar, BarChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
-import { api, Device, Incident, IncidentSeverity, IncidentSummary, useLive } from '../api';
+import { api, Device, downloadCsv, Incident, IncidentSeverity, IncidentSummary, useLive } from '../api';
 import { useAuth } from '../auth';
 import { clock, timeAgo } from '../format';
 import { Card, Empty, Kpi, Modal, PageHead, SeverityBadge, toast } from '../components/ui';
@@ -29,6 +29,7 @@ export default function Incidents() {
   return (
     <>
       <PageHead title="Security incidents" desc="Security events reported by devices, consolidated into one triage queue.">
+        <button className="btn" onClick={() => downloadCsv(`/incidents/export.csv${status ? `?status=${status}` : ''}`, 'security-incidents.csv').catch((e: Error) => toast(e.message, 'error'))}><Download size={15} />Export CSV</button>
         <button className="btn primary" disabled={!isAdmin} onClick={() => setAdding(true)}><Plus size={15} />Report incident</button>
       </PageHead>
 

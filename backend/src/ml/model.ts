@@ -5,13 +5,28 @@ import { extract, FEATURE_NAMES, HORIZON, WINDOW } from './features';
 /**
  * Anomaly *prediction* model: logistic regression that answers
  *   "will this metric cross its alert threshold within the next HORIZON readings?"
- * Trained on synthetic telemetry (drifts, leaks, decays, noise, recoveries) generated
- * in normalised units, so one model serves every metric and device type.
+ * The global model is trained on synthetic telemetry (drifts, leaks, decays, noise,
+ * recoveries) generated in normalised units, so one model serves every metric.
+ * A machine type can get its own model, retrained from the telemetry it has produced.
  */
+
+export interface Evaluation {
+  accuracy: number;
+  precision: number;
+  recall: number;
+  f1: number;
+  auc: number;
+  brier: number;
+  avgLeadReadings: number; // how many readings *before* the breach the model fires (p >= ALERT_PROB)
+  positiveRate: number;
+}
 
 export interface TrainedModel {
   version: string;
   trainedAt: string;
+  /** 'global' or the machine type this model was fitted for */
+  scope: string;
+  source: 'synthetic' | 'telemetry';
   featureNames: string[];
   weights: number[];
   bias: number;
@@ -21,17 +36,10 @@ export interface TrainedModel {
   horizon: number;
   trainSize: number;
   testSize: number;
-  evaluation: {
-    accuracy: number;
-    precision: number;
-    recall: number;
-    f1: number;
-    auc: number;
-    brier: number;
-    avgLeadReadings: number; // how many readings *before* the breach the model fires (p >= 0.5)
-    positiveRate: number;
-  };
+  evaluation: Evaluation;
 }
+
+export interface LabelledSample { x: number[]; y: 0 | 1; lead: number }
 
 export const MODEL_PATH = path.join(__dirname, '..', '..', 'models', 'anomaly-model.json');
 export const ALERT_PROB = 0.5;
@@ -47,10 +55,8 @@ function mulberry32(seed: number) {
 }
 const gauss = (r: () => number) => Math.sqrt(-2 * Math.log(1 - r())) * Math.cos(2 * Math.PI * r());
 
-interface Sample { x: number[]; y: 0 | 1; lead: number }
-
 /** One synthetic episode in normalised units (range = 1, breach level = 1). */
-function genSample(r: () => number): Sample {
+function genSample(r: () => number): LabelledSample {
   const u = (a: number, b: number) => a + r() * (b - a);
   const L0 = 1 - u(0.08, 0.8);
   const sigma = Math.exp(u(Math.log(0.0005), Math.log(0.03))); // log-uniform: covers very clean (battery) to noisy (CPU) signals
@@ -63,14 +69,11 @@ function genSample(r: () => number): Sample {
   else { slope = u(0.0005, 0.004); } // slow creep - rarely breaches in horizon
 
   const total = WINDOW + HORIZON;
-  const level: number[] = [];
   let noise = 0;
   const obs: number[] = [];
   for (let t = 0; t < total; t++) {
     noise = 0.5 * noise + sigma * gauss(r);
-    const lv = L0 + (t > onset ? slope * (t - onset) : 0);
-    level.push(lv);
-    obs.push(lv + noise);
+    obs.push(L0 + (t > onset ? slope * (t - onset) : 0) + noise);
   }
   const ex = extract(obs.slice(0, WINDOW), 1, 1)!;
   let lead = 0;
@@ -83,63 +86,55 @@ function genSample(r: () => number): Sample {
 
 const sigmoid = (z: number) => 1 / (1 + Math.exp(-z));
 
-export function trainModel(trainN = 8000, testN = 3000, seed = 42): TrainedModel {
-  const r = mulberry32(seed);
-  const gen = (n: number) => {
-    const out: Sample[] = [];
-    while (out.length < n) {
-      const s = genSample(r);
-      // skip episodes that are already breached at the end of the window
-      if (s.x[0] > 0) out.push(s);
-    }
-    return out;
-  };
-  const train = gen(trainN);
-  const test = gen(testN);
+/** Full-batch gradient descent with L2 regularisation and optional up-weighting of the positive class. */
+export function fitLogistic(train: LabelledSample[], opts: { positiveWeight?: number; epochs?: number } = {}) {
   const d = FEATURE_NAMES.length;
-
+  const pw = opts.positiveWeight ?? 1;
   const mean = Array(d).fill(0);
   const std = Array(d).fill(0);
   for (const s of train) s.x.forEach((v, i) => (mean[i] += v / train.length));
   for (const s of train) s.x.forEach((v, i) => (std[i] += (v - mean[i]) ** 2 / train.length));
   for (let i = 0; i < d; i++) std[i] = Math.sqrt(std[i]) || 1;
-  const z = (x: number[]) => x.map((v, i) => (v - mean[i]) / std[i]);
 
-  // full-batch gradient descent with L2 regularisation
+  const Z = train.map((s) => s.x.map((v, i) => (v - mean[i]) / std[i]));
+  const sw = train.map((s) => (s.y ? pw : 1));
+  const wsum = sw.reduce((a, b) => a + b, 0);
   const w = Array(d).fill(0);
   let b = 0;
-  const Z = train.map((s) => z(s.x));
   const lr = 0.5, l2 = 1e-3;
-  for (let epoch = 0; epoch < 800; epoch++) {
+  for (let epoch = 0; epoch < (opts.epochs ?? 800); epoch++) {
     const gw = Array(d).fill(0);
     let gb = 0;
     for (let n = 0; n < Z.length; n++) {
       let s = b;
       for (let i = 0; i < d; i++) s += w[i] * Z[n][i];
-      const err = sigmoid(s) - train[n].y;
+      const err = (sigmoid(s) - train[n].y) * sw[n];
       for (let i = 0; i < d; i++) gw[i] += err * Z[n][i];
       gb += err;
     }
-    for (let i = 0; i < d; i++) w[i] -= lr * (gw[i] / Z.length + l2 * w[i]);
-    b -= lr * (gb / Z.length);
+    for (let i = 0; i < d; i++) w[i] -= lr * (gw[i] / wsum + l2 * w[i]);
+    b -= lr * (gb / wsum);
   }
+  return { weights: w, bias: b, mean, std };
+}
 
-  const model: TrainedModel = {
-    version: '1.0.0',
-    trainedAt: new Date().toISOString(),
-    featureNames: FEATURE_NAMES,
-    weights: w,
-    bias: b,
-    mean,
-    std,
-    window: WINDOW,
-    horizon: HORIZON,
-    trainSize: trainN,
-    testSize: testN,
-    evaluation: null as any,
-  };
+export function auc(scores: number[], labels: number[]): number {
+  const idx = scores.map((_, i) => i).sort((a, b) => scores[a] - scores[b]);
+  let rankSum = 0, nPos = 0;
+  idx.forEach((i, rank) => { if (labels[i]) { rankSum += rank + 1; nPos++; } });
+  const nNeg = labels.length - nPos;
+  if (nPos === 0 || nNeg === 0) return 0.5;
+  return (rankSum - (nPos * (nPos + 1)) / 2) / (nPos * nNeg);
+}
 
-  // ---- evaluation on held-out episodes ----
+export function scoreFeatures(model: Pick<TrainedModel, 'weights' | 'bias' | 'mean' | 'std'>, x: number[]): number {
+  let s = model.bias;
+  for (let i = 0; i < x.length; i++) s += (model.weights[i] * (x[i] - model.mean[i])) / model.std[i];
+  return sigmoid(s);
+}
+
+/** Held-out evaluation: how well does the model separate episodes that breach from those that do not? */
+export function evaluate(model: Pick<TrainedModel, 'weights' | 'bias' | 'mean' | 'std'>, test: LabelledSample[]): Evaluation {
   const probs = test.map((s) => scoreFeatures(model, s.x));
   let tp = 0, fp = 0, tn = 0, fn = 0, brier = 0, leadSum = 0, leadN = 0, pos = 0;
   test.forEach((s, i) => {
@@ -153,7 +148,7 @@ export function trainModel(trainN = 8000, testN = 3000, seed = 42): TrainedModel
   });
   const precision = tp / Math.max(1, tp + fp);
   const recall = tp / Math.max(1, tp + fn);
-  model.evaluation = {
+  return {
     accuracy: (tp + tn) / test.length,
     precision,
     recall,
@@ -163,34 +158,69 @@ export function trainModel(trainN = 8000, testN = 3000, seed = 42): TrainedModel
     avgLeadReadings: leadN ? leadSum / leadN : 0,
     positiveRate: pos / test.length,
   };
-  return model;
 }
 
-function auc(scores: number[], labels: number[]): number {
-  const idx = scores.map((_, i) => i).sort((a, b) => scores[a] - scores[b]);
-  let rankSum = 0, nPos = 0;
-  idx.forEach((i, rank) => { if (labels[i]) { rankSum += rank + 1; nPos++; } });
-  const nNeg = labels.length - nPos;
-  return (rankSum - (nPos * (nPos + 1)) / 2) / Math.max(1, nPos * nNeg);
+export function trainModel(trainN = 8000, testN = 3000, seed = 42): TrainedModel {
+  const r = mulberry32(seed);
+  const gen = (n: number) => {
+    const out: LabelledSample[] = [];
+    while (out.length < n) {
+      const s = genSample(r);
+      if (s.x[0] > 0) out.push(s); // skip episodes that are already breached at the end of the window
+    }
+    return out;
+  };
+  const train = gen(trainN);
+  const test = gen(testN);
+  const fit = fitLogistic(train);
+  return {
+    version: '1.0.0',
+    trainedAt: new Date().toISOString(),
+    scope: 'global',
+    source: 'synthetic',
+    featureNames: FEATURE_NAMES,
+    ...fit,
+    window: WINDOW,
+    horizon: HORIZON,
+    trainSize: trainN,
+    testSize: testN,
+    evaluation: evaluate(fit, test),
+  };
 }
 
-export function scoreFeatures(model: TrainedModel, x: number[]): number {
-  let s = model.bias;
-  for (let i = 0; i < x.length; i++) s += (model.weights[i] * (x[i] - model.mean[i])) / model.std[i];
-  return sigmoid(s);
-}
+/* ------------------------------------------------------------------ model registry */
 
-let cachedModel: TrainedModel | null = null;
+let globalModel: TrainedModel | null = null;
+const typeModels = new Map<string, TrainedModel>();
 
-/** Load the trained model; train (and persist) it on first use if the file is absent. */
+/** The global model: loaded from disk, or trained (and saved) on first use. */
 export function loadModel(): TrainedModel {
-  if (cachedModel) return cachedModel;
+  if (globalModel) return globalModel;
   if (fs.existsSync(MODEL_PATH)) {
-    cachedModel = JSON.parse(fs.readFileSync(MODEL_PATH, 'utf8'));
+    const m = JSON.parse(fs.readFileSync(MODEL_PATH, 'utf8')) as TrainedModel;
+    globalModel = { ...m, scope: m.scope ?? 'global', source: m.source ?? 'synthetic' };
   } else {
-    cachedModel = trainModel();
+    globalModel = trainModel();
     fs.mkdirSync(path.dirname(MODEL_PATH), { recursive: true });
-    fs.writeFileSync(MODEL_PATH, JSON.stringify(cachedModel, null, 2));
+    fs.writeFileSync(MODEL_PATH, JSON.stringify(globalModel, null, 2));
   }
-  return cachedModel!;
+  return globalModel;
 }
+
+/** Register a model for 'global' or one machine type (called at boot and after retraining). */
+export function registerModel(scope: string, model: TrainedModel) {
+  if (scope === 'global') globalModel = model;
+  else typeModels.set(scope, model);
+}
+
+export function forgetModel(scope: string) {
+  if (scope === 'global') globalModel = null;
+  else typeModels.delete(scope);
+}
+
+/** A machine type uses its own model when one has been trained, otherwise the global one. */
+export function modelFor(type: string | null | undefined): TrainedModel {
+  return (type && typeModels.get(type)) || loadModel();
+}
+
+export const modelScopes = () => ['global', ...typeModels.keys()];

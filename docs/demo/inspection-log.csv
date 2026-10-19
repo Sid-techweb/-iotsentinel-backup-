@@ -1,0 +1,5 @@
+date,device,inspector,finding,action
+2026-09-02,Pump Station,A. Rao,Bearing housing warm to touch,Re-greased and rechecked after 2 hours
+2026-09-16,Pump Station,A. Rao,Vibration 4.1 mm/s at drive end,No action - within limit
+2026-10-01,Pump Station,S. Iyer,Coolant slightly discoloured,Scheduled coolant flush
+2026-10-08,CNC Machine,S. Iyer,Spindle vibration trending up,Booked spindle bearing replacement

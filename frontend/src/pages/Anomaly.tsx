@@ -1,13 +1,33 @@
+import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { RefreshCw, Undo2 } from 'lucide-react';
 import { useState } from 'react';
-import { DevicePrediction, FleetPrediction, METRIC_META, ModelCard, useLive } from '../api';
-import ForecastChart, { ChartLegend } from '../components/ForecastChart';
-import { Badge, Card, Empty, PageHead, RiskBadge, RiskBar } from '../components/ui';
-import { eta, pct } from '../format';
 import { Link } from 'react-router-dom';
+import { api, DevicePrediction, FleetPrediction, METRIC_META, ModelCard, ModelScope, ModelVersion, PredictionSnapshot, RetrainResult, useLive } from '../api';
+import { useAuth } from '../auth';
+import ExplainPanel from '../components/ExplainPanel';
+import ForecastChart, { ChartLegend } from '../components/ForecastChart';
+import { Badge, Card, Empty, Modal, PageHead, RiskBadge, RiskBar, toast } from '../components/ui';
+import { eta, pct, timeAgo } from '../format';
 
 export default function Anomaly() {
   const { data: fleet } = useLive<FleetPrediction[]>('/anomaly/predictions', 2500);
-  const { data: model } = useLive<ModelCard>('/anomaly/model', false);
+  const { isAdmin } = useAuth();
+  const qc = useQueryClient();
+  const [scope, setScope] = useState('global');
+  const { data: scopes } = useLive<ModelScope[]>('/anomaly/models', 15000);
+  const { data: model } = useLive<ModelCard>(`/anomaly/model?scope=${encodeURIComponent(scope)}`, 15000);
+  const [result, setResult] = useState<RetrainResult | null>(null);
+  const retrain = useMutation({
+    mutationFn: () => api.post<RetrainResult>('/anomaly/retrain', { deviceType: scope }),
+    onSuccess: (r) => { setResult(r); qc.invalidateQueries(); },
+    onError: (e: Error) => toast(e.message, 'error'),
+  });
+  const useGlobal = useMutation({
+    mutationFn: () => api.del(`/anomaly/models/${encodeURIComponent(scope)}`),
+    onSuccess: () => { qc.invalidateQueries(); toast('Using the global model again'); },
+    onError: (e: Error) => toast(e.message, 'error'),
+  });
+  const current = scopes?.find((m) => m.scope === scope);
   const [picked, setPicked] = useState<string | null>(null);
   const selected = picked ?? fleet?.[0]?.deviceId ?? null;
   const { data: detail } = useLive<DevicePrediction>(`/anomaly/predictions/${selected}`, 2500, !!selected);
@@ -22,7 +42,11 @@ export default function Anomaly() {
 
   return (
     <>
-      <PageHead title="Anomaly prediction" desc="Forecasts which devices will breach a limit before it happens, so staff can act ahead of the alert." />
+      <PageHead title="Anomaly prediction" desc="Forecasts which devices will breach a limit before it happens, so staff can act ahead of the alert.">
+        <select className="input" value={scope} onChange={(e) => setScope(e.target.value)} aria-label="Model to inspect">
+          {scopes?.map((m) => <option key={m.scope} value={m.scope}>{m.scope === 'global' ? 'Global model' : `${m.scope}${m.own ? ' (own model)' : ''}`}</option>)}
+        </select>
+      </PageHead>
 
       <div className="hero" style={{ marginBottom: 16 }}>
         <div>
@@ -81,6 +105,19 @@ export default function Anomaly() {
         </Card>
       </div>
 
+      {detail && detail.device.active && (
+        <div className="grid g2" style={{ marginTop: 16 }}>
+          <Card title="Why this risk?" sub={`${detail.device.name} · what the model saw and how it weighed it`}>
+            {detail.prediction.metrics.length === 0 ? <Empty>Not enough readings yet.</Empty> : (
+              <div className="stack" style={{ gap: 14 }}>
+                {detail.prediction.metrics.slice(0, 2).map((f) => <ExplainPanel key={f.metric} forecast={f} />)}
+              </div>
+            )}
+          </Card>
+          <HistoryCard deviceId={detail.device.id} />
+        </div>
+      )}
+
       {model && (
         <div className="grid g2" style={{ marginTop: 16 }}>
           <Card title="How the prediction works">
@@ -90,10 +127,16 @@ export default function Anomaly() {
               <li><b>Classifier.</b> A logistic-regression model ({model.parameterCount} parameters) outputs the probability the limit is crossed within {model.horizon} readings.</li>
               <li><b>Act early.</b> Above {pct(model.alertProbability)} a predictive alert opens with an estimated time-to-breach; it clears itself when the trend recovers.</li>
             </ol>
-            <p className="muted small" style={{ marginBottom: 0 }}>Trained on {model.trainSize.toLocaleString()} synthetic drift / leak / recovery episodes in normalised units, so one model covers every metric. Evaluated on {model.testSize.toLocaleString()} held-out episodes.</p>
+            <p className="muted small" style={{ marginBottom: 0 }}>
+              {model.source === 'synthetic'
+                ? <>Trained on {model.trainSize.toLocaleString()} synthetic drift / leak / recovery episodes in normalised units, so one model covers every metric. Evaluated on {model.testSize.toLocaleString()} held-out episodes.</>
+                : <>Fitted on {model.trainSize.toLocaleString()} windows of real <b>{model.scope}</b> telemetry and evaluated on the {model.testSize.toLocaleString()} most recent windows it had not seen.</>}
+            </p>
           </Card>
 
-          <Card title="Model card" sub={`${model.algorithm} · v${model.version}`}>
+          <Card title="Model card" sub={`${model.algorithm} · v${model.version}`}
+            action={<Badge tone={model.source === 'telemetry' ? 'pred' : ''}>{model.source === 'telemetry' ? 'trained on telemetry' : 'synthetic data'}</Badge>}>
+            {model.fallback && <div className="muted small" style={{ marginBottom: 10 }}><b>{scope}</b> has no model of its own yet, so it uses the global one.</div>}
             {(() => {
               const maxW = Math.max(...model.features.map((f) => Math.abs(f.weight)), 1e-6);
               return model.features.map((f) => (
@@ -107,11 +150,88 @@ export default function Anomaly() {
             <dl className="kv" style={{ margin: '14px 0 0' }}>
               <dt>Accuracy / F1</dt><dd>{pct(model.evaluation.accuracy)} / {model.evaluation.f1.toFixed(2)}</dd>
               <dt>Brier score (lower is better)</dt><dd>{model.evaluation.brier.toFixed(3)}</dd>
-              <dt>Trained</dt><dd>{new Date(model.trainedAt).toLocaleDateString()}</dd>
+              <dt>Trained</dt><dd>{timeAgo(model.trainedAt)}</dd>
             </dl>
+            {scope !== 'global' && (
+              <div className="row" style={{ marginTop: 14 }}>
+                <button className="btn primary sm" disabled={!isAdmin || retrain.isPending} onClick={() => retrain.mutate()}><RefreshCw size={13} className={retrain.isPending ? 'spin' : ''} />{retrain.isPending ? 'Training…' : 'Retrain from telemetry'}</button>
+                {current?.own && <button className="btn sm" disabled={!isAdmin || useGlobal.isPending} onClick={() => confirm(`Drop the model trained for ${scope} and use the global one?`) && useGlobal.mutate()}><Undo2 size={13} />Use global model</button>}
+              </div>
+            )}
+            <Versions scope={scope} canEdit={isAdmin} />
           </Card>
         </div>
       )}
+      {result && (
+        <Modal title={result.activated ? 'Model retrained' : 'Model not replaced'} onClose={() => setResult(null)} footer={<button className="btn primary" onClick={() => setResult(null)}>Close</button>}>
+          <p style={{ margin: 0 }}>{result.reason}</p>
+          <dl className="kv" style={{ margin: 0 }}>
+            <dt>Version</dt><dd>v{result.version}</dd>
+            <dt>Windows dropped between train and test</dt><dd>{result.samples.purged.toLocaleString()} (prevents look-ahead leakage)</dd>
+            <dt>Training windows</dt><dd>{result.samples.train.toLocaleString()} ({result.samples.positives.toLocaleString()} ended in a breach)</dd>
+            <dt>Held-out windows</dt><dd>{result.samples.test.toLocaleString()}</dd>
+            <dt>New model: AUC / precision / recall</dt><dd>{result.evaluation.auc.toFixed(2)} / {pct(result.evaluation.precision)} / {pct(result.evaluation.recall)}</dd>
+            <dt>Previous model: AUC / precision / recall</dt><dd>{result.previous.auc.toFixed(2)} / {pct(result.previous.precision)} / {pct(result.previous.recall)}</dd>
+          </dl>
+        </Modal>
+      )}
     </>
+  );
+}
+
+function HistoryCard({ deviceId }: { deviceId: string }) {
+  const { data } = useLive<PredictionSnapshot[]>(`/anomaly/history?deviceId=${deviceId}&limit=12`, 15000);
+  return (
+    <Card title="Prediction history" sub="Snapshots the model stored while a signal looked at risk (at most one every 30 s per signal)" flush>
+      {!data?.length ? <Empty>No at-risk predictions recorded for this device.</Empty> : (
+        <div className="table-wrap" style={{ maxHeight: 360, overflow: 'auto' }}><table>
+          <thead><tr><th>When</th><th>Signal</th><th className="num">Probability</th><th className="num">ETA</th><th>Model</th></tr></thead>
+          <tbody>
+            {data.map((h) => (
+              <tr key={h.id}>
+                <td className="muted nowrap">{timeAgo(h.createdAt)}</td>
+                <td>{METRIC_META[h.metric].label}</td>
+                <td className="num">{pct(h.probability)}</td>
+                <td className="num nowrap">{eta(h.secondsToBreach)}</td>
+                <td className="nowrap"><Badge tone={h.modelSource === 'telemetry' ? 'pred' : ''}>{h.modelScope} {h.modelVersion}</Badge></td>
+              </tr>
+            ))}
+          </tbody>
+        </table></div>
+      )}
+    </Card>
+  );
+}
+
+/** Every trained version for the selected scope - including retrains the validation gate rejected. */
+function Versions({ scope, canEdit }: { scope: string; canEdit: boolean }) {
+  const qc = useQueryClient();
+  const { data } = useLive<ModelVersion[]>(`/anomaly/models/${encodeURIComponent(scope)}/versions`, 20000);
+  const activate = useMutation({
+    mutationFn: (v: number) => api.post(`/anomaly/models/${encodeURIComponent(scope)}/versions/${v}/activate`),
+    onSuccess: () => { qc.invalidateQueries(); toast('Version activated'); },
+    onError: (e: Error) => toast(e.message, 'error'),
+  });
+  if (!data?.length) return null;
+  return (
+    <div style={{ marginTop: 16 }}>
+      <div className="strong" style={{ marginBottom: 6 }}>Versions</div>
+      <div className="table-wrap"><table>
+        <thead><tr><th>Ver.</th><th>Source</th><th className="num">AUC</th><th>Status</th><th /></tr></thead>
+        <tbody>
+          {data.map((v) => (
+            <tr key={v.id} title={v.reason}>
+              <td className="mono">v{v.version}</td>
+              <td className="small">{v.source}<div className="muted">{timeAgo(v.trainedAt)} · {v.trainedBy}</div></td>
+              <td className="num">{v.evaluation.auc.toFixed(2)}</td>
+              <td>{v.isActive ? <Badge tone="ok">active</Badge> : v.activated ? <Badge>accepted</Badge> : <Badge tone="crit">rejected</Badge>}</td>
+              <td style={{ textAlign: 'right' }}>
+                {!v.isActive && v.activated && scope !== 'global' && <button className="btn sm" disabled={!canEdit || activate.isPending} onClick={() => confirm(`Switch ${scope} back to model v${v.version}?`) && activate.mutate(v.version)}>Activate</button>}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table></div>
+    </div>
   );
 }

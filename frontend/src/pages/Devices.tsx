@@ -1,13 +1,13 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { Copy, Plus, Search } from 'lucide-react';
+import { Copy, Download, Plus, Search } from 'lucide-react';
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api, Device, DEVICE_TYPES, useLive } from '../api';
+import { api, Device, DeviceType, downloadCsv, useLive } from '../api';
 import { useAuth } from '../auth';
 import { fmtMetric, timeAgo } from '../format';
 import { Badge, Card, Empty, ErrorBox, Modal, PageHead, StatusBadge, toast } from '../components/ui';
 
-const FILTERS = ['all', 'online', 'degraded', 'offline'] as const;
+const FILTERS = ['all', 'online', 'degraded', 'offline', 'inactive'] as const;
 
 export default function Devices() {
   const nav = useNavigate();
@@ -17,13 +17,14 @@ export default function Devices() {
   const [adding, setAdding] = useState(false);
   const { data, error } = useLive<Device[]>('/devices', 3000);
 
-  const rows = (data ?? []).filter((d) => (filter === 'all' || d.status === filter) &&
-    `${d.name} ${d.type} ${d.location}`.toLowerCase().includes(search.toLowerCase()));
-  const count = (s: string) => (s === 'all' ? data?.length : data?.filter((d) => d.status === s).length) ?? 0;
+  const rows = (data ?? []).filter((d) => (filter === 'inactive' ? !d.active : filter === 'all' ? true : d.active && d.status === filter) &&
+    `${d.name} ${d.type} ${d.location} #${d.assetNo}`.toLowerCase().includes(search.toLowerCase().trim()));
+  const count = (s: string) => (s === 'all' ? data?.length : s === 'inactive' ? data?.filter((d) => !d.active).length : data?.filter((d) => d.active && d.status === s).length) ?? 0;
 
   return (
     <>
       <PageHead title="Devices" desc="Central inventory with live connectivity and the latest readings.">
+        <button className="btn" onClick={() => downloadCsv('/devices/export.csv', 'devices.csv').catch((e: Error) => toast(e.message, 'error'))}><Download size={15} />Export CSV</button>
         <button className="btn primary" disabled={!isAdmin} title={isAdmin ? undefined : 'Read-only account'} onClick={() => setAdding(true)}><Plus size={15} />Register device</button>
       </PageHead>
 
@@ -33,7 +34,7 @@ export default function Devices() {
         </div>
         <div style={{ position: 'relative' }}>
           <Search size={14} style={{ position: 'absolute', left: 10, top: 10, color: 'var(--muted)' }} />
-          <input className="input" style={{ paddingLeft: 30, width: 260 }} placeholder="Search name, type, location…" value={search} onChange={(e) => setSearch(e.target.value)} aria-label="Search devices" />
+          <input className="input" style={{ paddingLeft: 30, width: 260 }} placeholder="Search name, #number, type, location…" value={search} onChange={(e) => setSearch(e.target.value)} aria-label="Search devices" />
         </div>
       </div>
 
@@ -44,8 +45,8 @@ export default function Devices() {
             <tbody>
               {rows.map((d) => (
                 <tr key={d.id} className="click" onClick={() => nav(`/devices/${d.id}`)}>
-                  <td><div className="strong">{d.name}</div><div className="muted small">{d.type}{d.simulated ? ' · simulated' : ''}</div></td>
-                  <td><StatusBadge status={d.status} /></td>
+                  <td><div className="strong">{d.name} <span className="muted small mono">#{d.assetNo}</span></div><div className="muted small">{d.type}{d.simulated ? ' · simulated' : ''}</div></td>
+                  <td>{d.active ? <StatusBadge status={d.status} /> : <Badge>deactivated</Badge>}</td>
                   <td>{d.location}</td>
                   <td className="nowrap mono">{d.firmwareVersion} {d.outdated && <Badge tone="warn">update</Badge>}</td>
                   <td className="num">{fmtMetric('temperature', d.latest?.temperature)}</td>
@@ -66,10 +67,11 @@ export default function Devices() {
 
 function RegisterModal({ onClose }: { onClose: () => void }) {
   const qc = useQueryClient();
-  const [f, setF] = useState({ name: '', type: DEVICE_TYPES[0], location: '', ipAddress: '', firmwareVersion: '1.0.0', simulated: true });
+  const { data: types } = useLive<DeviceType[]>('/device-types', false);
+  const [f, setF] = useState({ name: '', type: '', location: '', ipAddress: '', firmwareVersion: '1.0.0', simulated: true });
   const [created, setCreated] = useState<Device | null>(null);
   const m = useMutation({
-    mutationFn: () => api.post<Device>('/devices', { ...f, ipAddress: f.ipAddress || undefined, location: f.location || 'Unassigned' }),
+    mutationFn: () => api.post<Device>('/devices', { ...f, type: f.type || types?.[0]?.name, ipAddress: f.ipAddress || undefined, location: f.location || 'Unassigned' }),
     onSuccess: (d) => { setCreated(d); qc.invalidateQueries(); toast(`${d.name} registered`); },
     onError: (e: Error) => toast(e.message, 'error'),
   });
@@ -94,7 +96,7 @@ function RegisterModal({ onClose }: { onClose: () => void }) {
       footer={<><button className="btn" onClick={onClose}>Cancel</button><button className="btn primary" disabled={m.isPending || f.name.trim().length < 2} onClick={() => m.mutate()}>Register</button></>}>
       <label className="field">Name<input className="input" autoFocus value={f.name} onChange={(e) => set('name', e.target.value)} placeholder="e.g. sensor-plantC-01" /></label>
       <div className="form-2">
-        <label className="field">Type<select className="input" value={f.type} onChange={(e) => set('type', e.target.value)}>{DEVICE_TYPES.map((t) => <option key={t}>{t}</option>)}</select></label>
+        <label className="field">Type<select className="input" value={f.type || types?.[0]?.name || ''} onChange={(e) => set('type', e.target.value)}>{types?.map((t) => <option key={t.id} value={t.name}>{t.name}</option>)}</select></label>
         <label className="field">Location<input className="input" value={f.location} onChange={(e) => set('location', e.target.value)} placeholder="Plant C" /></label>
         <label className="field">IP address (optional)<input className="input" value={f.ipAddress} onChange={(e) => set('ipAddress', e.target.value)} placeholder="10.20.0.50" /></label>
         <label className="field">Firmware version<input className="input mono" value={f.firmwareVersion} onChange={(e) => set('firmwareVersion', e.target.value)} /></label>

@@ -1,12 +1,17 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    # PostgreSQL 16 + pgvector (built from docker/postgres/Dockerfile on the same Alpine base as before,
+    # so existing data volumes keep working)
+    build: ./docker/postgres
+    image: iot-sentinel-postgres:16-pgvector
+    restart: unless-stopped
     environment:
       POSTGRES_USER: iot
-      POSTGRES_PASSWORD: iot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-iot}
       POSTGRES_DB: iotmonitor
-    ports: ["5433:5432"]
+    ports: ["127.0.0.1:5433:5432"]   # reachable from this machine only
     volumes: [pgdata:/var/lib/postgresql/data]
+    mem_limit: 1g
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U iot -d iotmonitor"]
       interval: 5s
@@ -14,7 +19,9 @@ services:
 
   redis:
     image: redis:7-alpine
-    ports: ["6379:6379"]
+    restart: unless-stopped
+    ports: ["127.0.0.1:6379:6379"]   # reachable from this machine only
+    mem_limit: 256m
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -22,20 +29,59 @@ services:
 
   backend:
     build: ./backend
+    restart: unless-stopped
     environment:
-      DATABASE_URL: postgres://iot:iot@postgres:5432/iotmonitor
+      DATABASE_URL: postgres://iot:${POSTGRES_PASSWORD:-iot}@postgres:5432/iotmonitor
       REDIS_URL: redis://redis:6379
-      SIMULATOR: "true"
-      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
-    ports: ["4000:4000"]
+      SIMULATOR: ${SIMULATOR:-true}
+      # Leave empty to have a strong random secret generated once and kept in the data volume.
+      JWT_SECRET: ${JWT_SECRET:-}
+      TRUST_PROXY: "1"                 # nginx sits in front of the API
+      ALLOW_PRIVATE_WEBHOOKS: "false"  # webhooks may not target internal addresses
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8080}
+      DATA_DIR: /data
+      UPLOAD_DIR: /data/uploads
+      DOCS_DIR: /app/docs
+      # --- AI assistant (Ollama runs on the host by default; see docs/DEPLOYMENT_GUIDE.md) ---
+      LLM_PROVIDER: ollama
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      LLM_MODEL: ${LLM_MODEL:-qwen2.5:7b}
+      EMBED_MODEL: ${EMBED_MODEL:-qwen3-embedding:0.6b}
+      LLM_TIMEOUT_MS: ${LLM_TIMEOUT_MS:-180000}
+      LLM_NUM_CTX: ${LLM_NUM_CTX:-4096}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports: ["127.0.0.1:4000:4000"]
+    volumes:
+      - appdata:/data          # uploaded documents + generated JWT secret
+      - modelsdata:/app/models # trained prediction models
+      - ./docs:/app/docs:ro    # the project's own documentation, indexed for the assistant
+    mem_limit: 1g
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
 
   frontend:
     build: ./frontend
+    restart: unless-stopped
     ports: ["8080:80"]
-    depends_on: [backend]
+    mem_limit: 128m
+    depends_on:
+      backend: { condition: service_healthy }
+
+  # Optional: run Ollama inside Docker instead of on the host.
+  #   docker compose --profile ollama up -d
+  #   docker compose exec ollama ollama pull qwen2.5:7b   (about 4.7 GB - download only when you choose to)
+  # and set OLLAMA_URL=http://ollama:11434 in .env. GPU use needs the NVIDIA container toolkit.
+  ollama:
+    profiles: ["ollama"]
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes: [ollamadata:/root/.ollama]
+    ports: ["127.0.0.1:11435:11434"]
 
 volumes:
   pgdata:
+  appdata:
+  modelsdata:
+  ollamadata:

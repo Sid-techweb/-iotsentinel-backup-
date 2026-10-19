@@ -1,8 +1,8 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { Check, Eye } from 'lucide-react';
+import { Check, Download, Eye } from 'lucide-react';
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Alert, api, METRIC_META, useLive } from '../api';
+import { Alert, api, downloadCsv, METRIC_META, useLive } from '../api';
 import { useAuth } from '../auth';
 import { timeAgo } from '../format';
 import { Badge, Card, Empty, PageHead, SeverityBadge, toast } from '../components/ui';
@@ -33,6 +33,7 @@ export default function Alerts() {
           {[['active', 'Active'], ['resolved', 'Resolved'], ['', 'All']].map(([v, l]) => <button key={l} className={`chip ${status === v ? 'on' : ''}`} onClick={() => setStatus(v)}>{l}</button>)}
         </div>
         <div className="row">
+          <button className="btn" onClick={() => downloadCsv(`/alerts/export.csv?${qs}`, 'alerts.csv').catch((e: Error) => toast(e.message, 'error'))}><Download size={14} />Export CSV</button>
           <select className="input" value={type} onChange={(e) => setType(e.target.value)} aria-label="Alert type">{TYPES.map(([v, l]) => <option key={v} value={v}>{l}</option>)}</select>
           <select className="input" value={severity} onChange={(e) => setSeverity(e.target.value)} aria-label="Severity">
             <option value="">All severities</option><option value="critical">Critical</option><option value="warning">Warning</option>

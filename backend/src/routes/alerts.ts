@@ -1,12 +1,14 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { q } from '../db';
-import { asyncH, HttpError } from '../util';
+import { publish } from '../services/events';
+import { audit, ctxOf } from '../services/audit';
+import { asyncH, HttpError, toCsv } from '../util';
 
 export const alertsRouter = Router();
 
-alertsRouter.get('/', asyncH(async (req, res) => {
-  const { status, severity, type, deviceId, rangeSec } = req.query as Record<string, string | undefined>;
+async function listAlerts(query: Record<string, string | undefined>, limit: number) {
+  const { status, severity, type, deviceId, rangeSec } = query;
   const where: string[] = [];
   const params: unknown[] = [];
   if (status === 'active') where.push(`a.status <> 'resolved'`);
@@ -15,10 +17,25 @@ alertsRouter.get('/', asyncH(async (req, res) => {
   if (type) { params.push(type); where.push(`a.type = $${params.length}`); }
   if (deviceId) { params.push(deviceId); where.push(`a.device_id = $${params.length}`); }
   if (rangeSec) { params.push(Number(rangeSec)); where.push(`(a.status <> 'resolved' OR a.resolved_at > now() - make_interval(secs => $${params.length}::float8))`); }
-  res.json(await q(
+  return q(
     `SELECT a.*, d.name AS device_name, d.type AS device_type FROM alerts a JOIN devices d ON d.id=a.device_id
      ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
-     ORDER BY (a.status='resolved'), a.created_at DESC LIMIT 200`, params));
+     ORDER BY (a.status='resolved'), a.created_at DESC LIMIT ${limit}`, params);
+}
+
+alertsRouter.get('/', asyncH(async (req, res) => {
+  res.json(await listAlerts(req.query as Record<string, string | undefined>, 200));
+}));
+
+alertsRouter.get('/export.csv', asyncH(async (req, res) => {
+  const rows = await listAlerts(req.query as Record<string, string | undefined>, 5000);
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="alerts.csv"');
+  res.send(toCsv(rows, [
+    { key: 'id', header: 'ID' }, { key: 'createdAt', header: 'Raised' }, { key: 'severity', header: 'Severity' },
+    { key: 'type', header: 'Type' }, { key: 'deviceName', header: 'Device' }, { key: 'metric', header: 'Metric' },
+    { key: 'message', header: 'Message' }, { key: 'status', header: 'Status' }, { key: 'resolvedAt', header: 'Resolved' },
+  ]));
 }));
 
 alertsRouter.patch('/:id', asyncH(async (req, res) => {
@@ -28,5 +45,7 @@ alertsRouter.patch('/:id', asyncH(async (req, res) => {
     [req.params.id, status],
   );
   if (!rows.length) throw new HttpError(404, 'Alert not found');
+  publish('alert', { id: rows[0].id });
+  audit(ctxOf(req), 'alert.' + status, 'alert', req.params.id);
   res.json(rows[0]);
 }));

@@ -1,11 +1,13 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, Copy, KeyRound, Trash2, Wrench } from 'lucide-react';
+import { ArrowLeft, Copy, KeyRound, Power, Sparkles, Trash2, Wrench } from 'lucide-react';
 import { useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { Alert, api, Device, DevicePrediction, FwUpdate, Incident, METRIC_KEYS, METRIC_META, MetricKey, useLive } from '../api';
 import { useAuth } from '../auth';
 import Flash from '../components/Flash';
+import ExplainPanel from '../components/ExplainPanel';
 import ForecastChart, { ChartLegend } from '../components/ForecastChart';
+import MaintenanceCard from '../components/MaintenanceCard';
 import { Badge, Card, Empty, ErrorBox, Modal, PageHead, RiskBadge, SeverityBadge, StatusBadge, toast } from '../components/ui';
 import { eta, fmtMetric, pct, timeAgo } from '../format';
 
@@ -31,6 +33,11 @@ export default function DeviceDetail() {
     onSuccess: (r) => setNewKey(r.apiKey),
     onError: (e: Error) => toast(e.message, 'error'),
   });
+  const toggleActive = useMutation({
+    mutationFn: (active: boolean) => api.patch<Device>(`/devices/${id}`, { active }),
+    onSuccess: (d) => { toast(d.active ? 'Device reactivated' : 'Device deactivated'); qc.invalidateQueries(); },
+    onError: (e: Error) => toast(e.message, 'error'),
+  });
   const remove = useMutation({
     mutationFn: () => api.del(`/devices/${id}`),
     onSuccess: () => { toast('Device removed'); qc.invalidateQueries(); nav('/devices'); },
@@ -47,9 +54,15 @@ export default function DeviceDetail() {
   return (
     <>
       <div style={{ marginBottom: 12 }}><Link to="/devices" className="btn sm ghost"><ArrowLeft size={14} />All devices</Link></div>
-      <PageHead title={dev.name} desc={`${dev.type} · ${dev.location}${dev.ipAddress ? ` · ${dev.ipAddress}` : ''}`}>
-        <StatusBadge status={dev.status} />
-        {pred && <RiskBadge level={pred.prediction.level} />}
+      <PageHead title={dev.name} desc={`Asset #${dev.assetNo} · ${dev.type} · ${dev.location}${dev.ipAddress ? ` · ${dev.ipAddress}` : ''}`}>
+        {dev.active ? <StatusBadge status={dev.status} /> : <Badge>deactivated</Badge>}
+        {dev.simulated && <Badge tone="info">simulated</Badge>}
+        {pred && dev.active && <RiskBadge level={pred.prediction.level} />}
+        <Link className="btn sm" to={`/assistant?device=${dev.id}&q=${encodeURIComponent('Why is this device showing its current risk level?')}`}><Sparkles size={14} />Ask the assistant</Link>
+        <button className="btn sm" disabled={!isAdmin || toggleActive.isPending}
+          onClick={() => (dev.active ? confirm(`Deactivate ${dev.name}? It stops being monitored, its open alerts are closed and it can no longer send telemetry. History is kept.`) : true) && toggleActive.mutate(!dev.active)}>
+          <Power size={14} />{dev.active ? 'Deactivate' : 'Reactivate'}
+        </button>
         <button className="btn danger sm" disabled={!isAdmin} onClick={() => confirm(`Remove ${dev.name}? Its history will be deleted.`) && remove.mutate()}><Trash2 size={14} />Remove</button>
       </PageHead>
 
@@ -88,6 +101,14 @@ export default function DeviceDetail() {
               })}
             </div>
           </Card>
+
+          {(pred?.prediction.metrics ?? []).slice(0, 2).length > 0 && dev.active && (
+            <Card title="Why this risk?" sub="How the model reached its probability - using only the numbers it was given">
+              <div className="stack" style={{ gap: 14 }}>
+                {(pred?.prediction.metrics ?? []).slice(0, 2).map((f) => <ExplainPanel key={f.metric} forecast={f} />)}
+              </div>
+            </Card>
+          )}
         </div>
 
         <div className="stack">
@@ -106,10 +127,12 @@ export default function DeviceDetail() {
             )}
           </Card>
 
+          <MaintenanceCard deviceId={dev.id} />
+
           <Card title="Recent alerts" flush>
             <ul className="feed">
               {hist?.alerts.slice(0, 6).map((a) => (
-                <li key={a.id}>
+                <li key={a.id} style={{ gridTemplateColumns: 'auto 1fr auto' }}>
                   <Badge tone={a.type === 'predictive' ? 'pred' : ''}>{a.type}</Badge>
                   <div><div className="t">{a.message}</div><div className="muted small">{timeAgo(a.createdAt)} · {a.status}</div></div>
                   <SeverityBadge severity={a.severity} />
@@ -122,7 +145,7 @@ export default function DeviceDetail() {
           <Card title="Security incidents" flush>
             <ul className="feed">
               {hist?.incidents.slice(0, 4).map((i) => (
-                <li key={i.id}><Badge>{i.status}</Badge><div><div className="t strong">{i.category}</div><div className="muted small">{i.description}</div></div><SeverityBadge severity={i.severity} /></li>
+                <li key={i.id} style={{ gridTemplateColumns: 'auto 1fr auto' }}><Badge>{i.status}</Badge><div><div className="t strong">{i.category}</div><div className="muted small">{i.description}</div></div><SeverityBadge severity={i.severity} /></li>
               ))}
               {!hist?.incidents.length && <Empty>No incidents recorded.</Empty>}
             </ul>

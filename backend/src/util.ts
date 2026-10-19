@@ -40,3 +40,17 @@ export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** Device keys are random 128-bit values, so a fast SHA-256 is enough and keeps ingest lookups O(1). */
 export const hashKey = (key: string) => crypto.createHash('sha256').update(key).digest('hex');
 export const newDeviceKey = () => crypto.randomBytes(16).toString('hex');
+
+/** CSV with RFC 4180 quoting; cells that start like a spreadsheet formula are neutralised (CSV injection). */
+const csvCell = (v: unknown) => {
+  if (v === null || v === undefined) return '';
+  let s = v instanceof Date ? v.toISOString() : String(v);
+  if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+/** Header line / body lines separately, so large exports can be streamed in batches. */
+export const csvHeader = (columns: { header: string }[]) => columns.map((c) => csvCell(c.header)).join(',') + '\r\n';
+export const csvBody = (rows: Record<string, unknown>[], columns: { key: string }[]) => rows.map((r) => columns.map((c) => csvCell(r[c.key])).join(',') + '\r\n').join('');
+export function toCsv(rows: Record<string, unknown>[], columns: { key: string; header: string }[]): string {
+  return csvHeader(columns) + csvBody(rows, columns);
+}

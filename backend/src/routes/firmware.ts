@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { q, q1 } from '../db';
 import { startUpdate } from '../services/firmwareUpdates';
+import { audit, ctxOf } from '../services/audit';
 import { asyncH, compareVersions, HttpError } from '../util';
 
 export const firmwareRouter = Router();
@@ -47,11 +48,13 @@ firmwareRouter.get('/updates', asyncH(async (_req, res) => {
 
 firmwareRouter.post('/updates', asyncH(async (req, res) => {
   const b = z.object({ deviceId: z.string().uuid(), toVersion: z.string().optional() }).parse(req.body);
-  res.status(201).json(await startUpdate(b.deviceId, b.toVersion));
+  const upd = await startUpdate(b.deviceId, b.toVersion);
+  audit(ctxOf(req), 'firmware.update', 'device', b.deviceId, { toVersion: b.toVersion ?? 'latest' });
+  res.status(201).json(upd);
 }));
 
 /** Roll the latest release out to every online, outdated device (one batch, staggered by the simulator). */
-firmwareRouter.post('/updates/bulk', asyncH(async (_req, res) => {
+firmwareRouter.post('/updates/bulk', asyncH(async (req, res) => {
   const targets = await q<any>(
     `SELECT d.id FROM devices d WHERE d.status <> 'offline'
        AND d.firmware_version <> COALESCE((SELECT r.version FROM firmware_releases r WHERE r.device_type=d.type ORDER BY r.released_at DESC, r.id DESC LIMIT 1), d.firmware_version)
@@ -60,5 +63,6 @@ firmwareRouter.post('/updates/bulk', asyncH(async (_req, res) => {
   for (const t of targets) {
     try { await startUpdate(t.id); started++; } catch { /* skip devices that cannot update right now */ }
   }
+  audit(ctxOf(req), 'firmware.bulk_update', null, null, { started });
   res.status(201).json({ started });
 }));

@@ -1,20 +1,31 @@
-import { Activity, BellRing, BrainCircuit, Cpu, History, LayoutDashboard, LogOut, Moon, ShieldAlert, SlidersHorizontal, Sun, UserRound, Wrench } from 'lucide-react';
-import { ReactNode, useState } from 'react';
+import { Activity, BellRing, BookOpen, BrainCircuit, FileBarChart, Boxes, Sparkles, Cpu, History, ScrollText, LayoutDashboard, LogOut, Moon, Send, ShieldAlert, SlidersHorizontal, Sun, UserRound, Users, Wrench } from 'lucide-react';
+import { lazy, ReactNode, Suspense, useState } from 'react';
 import { Navigate, NavLink, Route, Routes } from 'react-router-dom';
 import { Summary, useLive } from './api';
 import { useAuth } from './auth';
 import { Toaster } from './components/ui';
-import Account from './pages/Account';
-import Activity_ from './pages/Activity';
-import Alerts from './pages/Alerts';
-import Anomaly from './pages/Anomaly';
+import { usePushConnected } from './live';
 import { LoginPage, RegisterPage } from './pages/AuthPages';
-import Dashboard from './pages/Dashboard';
-import DeviceDetail from './pages/DeviceDetail';
-import Devices from './pages/Devices';
-import Firmware from './pages/Firmware';
-import Incidents from './pages/Incidents';
-import Rules from './pages/Rules';
+import { useEventStream } from './useEventStream';
+
+// every screen is a separate chunk, downloaded the first time it is opened
+const Account = lazy(() => import('./pages/Account'));
+const Activity_ = lazy(() => import('./pages/Activity'));
+const Alerts = lazy(() => import('./pages/Alerts'));
+const Anomaly = lazy(() => import('./pages/Anomaly'));
+const Assistant = lazy(() => import('./pages/Assistant'));
+const KnowledgeBase = lazy(() => import('./pages/KnowledgeBase'));
+const Dashboard = lazy(() => import('./pages/Dashboard'));
+const DeviceDetail = lazy(() => import('./pages/DeviceDetail'));
+const Devices = lazy(() => import('./pages/Devices'));
+const Firmware = lazy(() => import('./pages/Firmware'));
+const Incidents = lazy(() => import('./pages/Incidents'));
+const MachineTypes = lazy(() => import('./pages/MachineTypes'));
+const Notifications = lazy(() => import('./pages/Notifications'));
+const Reports = lazy(() => import('./pages/Reports'));
+const Rules = lazy(() => import('./pages/Rules'));
+const UsersPage = lazy(() => import('./pages/Users'));
+const AuditLog = lazy(() => import('./pages/AuditLog'));
 
 export default function App() {
   const { user, ready } = useAuth();
@@ -33,7 +44,9 @@ export default function App() {
 }
 
 function Shell() {
-  const { user, logout } = useAuth();
+  const { user, logout, isAdmin } = useAuth();
+  useEventStream(true);
+  const push = usePushConnected();
   const { data: summary, isError } = useLive<Summary>('/dashboard/summary', 4000);
   const [theme, setTheme] = useState(document.documentElement.dataset.theme ?? 'dark');
   const activeAlerts = summary?.alerts.reduce((n, a) => n + a.count, 0) ?? 0;
@@ -65,14 +78,22 @@ function Shell() {
           {link('/alerts', <BellRing size={17} />, 'Alerts', activeAlerts)}
           {link('/anomaly', <BrainCircuit size={17} />, 'Anomaly Prediction')}
           {link('/activity', <History size={17} />, 'Activity')}
+          {link('/reports', <FileBarChart size={17} />, 'Reports')}
+          <div className="nav-label">Assistant</div>
+          {link('/assistant', <Sparkles size={17} />, 'AI Assistant')}
+          {link('/knowledge', <BookOpen size={17} />, 'Knowledge Base')}
           <div className="nav-label">Manage</div>
           {link('/firmware', <Wrench size={17} />, 'Firmware')}
           {link('/incidents', <ShieldAlert size={17} />, 'Security Incidents')}
+          {link('/types', <Boxes size={17} />, 'Machine Types')}
           {link('/rules', <SlidersHorizontal size={17} />, 'Alert Rules')}
+          {isAdmin && link('/notifications', <Send size={17} />, 'Notifications')}
+          {isAdmin && link('/users', <Users size={17} />, 'Users')}
+          {isAdmin && link('/audit', <ScrollText size={17} />, 'Audit Log')}
           {link('/account', <UserRound size={17} />, 'Account')}
         </nav>
         <div className="side-foot">
-          <div className="live"><span className={`pulse ${isError ? 'down' : ''}`} />{isError ? 'API unreachable' : 'Live - updating'}</div>
+          <div className="live"><span className={`pulse ${isError ? 'down' : ''}`} />{isError ? 'API unreachable' : push ? 'Live - push updates' : 'Live - polling'}</div>
           <div className="who">
             <div className="avatar" aria-hidden>{user?.name.slice(0, 1).toUpperCase()}</div>
             <div style={{ minWidth: 0 }}>
@@ -87,6 +108,7 @@ function Shell() {
         </div>
       </aside>
       <main className="main">
+        <Suspense fallback={<div className="empty">Loading…</div>}>
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/devices" element={<Devices />} />
@@ -94,12 +116,20 @@ function Shell() {
           <Route path="/alerts" element={<Alerts />} />
           <Route path="/anomaly" element={<Anomaly />} />
           <Route path="/activity" element={<Activity_ />} />
+          <Route path="/reports" element={<Reports />} />
+          <Route path="/assistant" element={<Assistant />} />
+          <Route path="/knowledge" element={<KnowledgeBase />} />
           <Route path="/firmware" element={<Firmware />} />
           <Route path="/incidents" element={<Incidents />} />
           <Route path="/rules" element={<Rules />} />
+          <Route path="/types" element={<MachineTypes />} />
+          <Route path="/notifications" element={isAdmin ? <Notifications /> : <Navigate to="/" replace />} />
+          <Route path="/users" element={isAdmin ? <UsersPage /> : <Navigate to="/" replace />} />
+          <Route path="/audit" element={isAdmin ? <AuditLog /> : <Navigate to="/" replace />} />
           <Route path="/account" element={<Account />} />
           <Route path="*" element={<div className="empty">Page not found</div>} />
         </Routes>
+        </Suspense>
       </main>
     </div>
   );

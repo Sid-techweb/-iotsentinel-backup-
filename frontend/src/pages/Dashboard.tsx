@@ -1,7 +1,8 @@
 import { AlertTriangle, BrainCircuit, Cpu, ShieldAlert, Wifi, Wrench } from 'lucide-react';
+import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { Area, AreaChart, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
-import { FleetPrediction, Summary, useLive } from '../api';
+import { DeviceType, FleetPrediction, Summary, useLive } from '../api';
 import { clock, eta, timeAgo } from '../format';
 import { Badge, Card, Empty, ErrorBox, Kpi, PageHead, RiskBar, SeverityBadge } from '../components/ui';
 import { METRIC_META } from '../api';
@@ -11,16 +12,21 @@ const STATUS_COLORS = { online: 'var(--ok)', degraded: 'var(--warn)', offline: '
 
 export default function Dashboard() {
   const nav = useNavigate();
-  const { data: s, error } = useLive<Summary>('/dashboard/summary', 3000);
+  const [type, setType] = useState('');
+  const { data: types } = useLive<DeviceType[]>('/device-types', false);
+  const { data: s, error } = useLive<Summary>(`/dashboard/summary${type ? `?type=${encodeURIComponent(type)}` : ''}`, 3000);
   const { data: preds } = useLive<FleetPrediction[]>('/anomaly/predictions', 3000);
   if (error && !s) return <ErrorBox error={error} />;
   if (!s) return <div className="empty">Loading fleet…</div>;
 
+  const fleet = (preds ?? []).filter((p) => !type || p.type === type);
+  const levels = { low: 0, elevated: 0, high: 0, breached: 0 } as Record<string, number>;
+  for (const p of fleet) levels[p.level] = (levels[p.level] ?? 0) + 1;
   const alertTotal = s.alerts.reduce((n, a) => n + a.count, 0);
   const critical = s.alerts.filter((a) => a.severity === 'critical').reduce((n, a) => n + a.count, 0);
   const predictive = s.alerts.filter((a) => a.type === 'predictive').reduce((n, a) => n + a.count, 0);
   const incidents = s.incidents.reduce((n, a) => n + a.count, 0);
-  const atRisk = (preds ?? []).filter((p) => p.level === 'high' || p.level === 'elevated');
+  const atRisk = fleet.filter((p) => p.level === 'high' || p.level === 'elevated');
   const healthy = s.totals.all ? Math.round((s.totals.online / s.totals.all) * 100) : 0;
 
   const pie = (['online', 'degraded', 'offline'] as const).map((k) => ({ name: k, value: s.totals[k] })).filter((d) => d.value > 0);
@@ -39,10 +45,15 @@ export default function Dashboard() {
 
   return (
     <>
-      <PageHead title="Fleet overview" desc="Live health, alerts and security posture across every registered device." />
+      <PageHead title="Fleet overview" desc="Live health, alerts and security posture across every device in service.">
+        <select className="input" value={type} onChange={(e) => setType(e.target.value)} aria-label="Filter by machine type">
+          <option value="">All machine types</option>
+          {types?.map((t) => <option key={t.id} value={t.name}>{t.name}</option>)}
+        </select>
+      </PageHead>
 
       <div className="grid kpis">
-        <Kpi label="Devices" icon={<Cpu size={14} />} value={s.totals.all} note={`${s.totals.online} online · ${s.totals.degraded} degraded · ${s.totals.offline} offline`} />
+        <Kpi label="Devices" icon={<Cpu size={14} />} value={s.totals.all} note={`${s.totals.online} online · ${s.totals.degraded} degraded · ${s.totals.offline} offline${s.totals.inactive ? ` · ${s.totals.inactive} deactivated` : ''}`} />
         <Kpi label="Fleet availability" icon={<Wifi size={14} />} value={`${healthy}%`} tone={healthy >= 90 ? 'ok' : healthy >= 70 ? 'warn' : 'crit'} note="devices reporting normally" />
         <Kpi label="Active alerts" icon={<AlertTriangle size={14} />} value={alertTotal} tone={critical ? 'crit' : alertTotal ? 'warn' : 'ok'} note={`${critical} critical · ${predictive} predictive`} />
         <Kpi label="Predicted at risk" icon={<BrainCircuit size={14} />} value={atRisk.length} tone={atRisk.length ? 'pred' : 'ok'} note="devices the model expects to breach" />
@@ -54,13 +65,13 @@ export default function Dashboard() {
         <div className="stack">
           <Card title="Predicted to breach soon" sub="Anomaly model forecast - acts before the threshold alert fires"
             action={<Link className="btn sm" to="/anomaly">Open predictor</Link>} flush>
-            {(preds ?? []).filter((p) => p.level !== 'low').length === 0 ? (
+            {fleet.filter((p) => p.level !== 'low').length === 0 ? (
               <Empty>No device is trending toward a threshold right now.</Empty>
             ) : (
               <div className="table-wrap"><table>
                 <thead><tr><th>Device</th><th>Metric</th><th>Risk</th><th className="num">Breach in</th></tr></thead>
                 <tbody>
-                  {(preds ?? []).filter((p) => p.level !== 'low').slice(0, 6).map((p) => (
+                  {fleet.filter((p) => p.level !== 'low').slice(0, 6).map((p) => (
                     <tr key={p.deviceId} className="click" onClick={() => nav(`/devices/${p.deviceId}`)}>
                       <td><div className="strong">{p.name}</div><div className="muted small">{p.type} · {p.location}</div></td>
                       <td>{p.topMetric ? METRIC_META[p.topMetric].label : '-'}</td>
@@ -70,6 +81,21 @@ export default function Dashboard() {
                   ))}
                 </tbody>
               </table></div>
+            )}
+          </Card>
+
+          <Card title="Risk distribution" sub="Devices by predicted risk of crossing a limit (not equipment failure)">
+            {fleet.length === 0 ? <Empty>No devices are reporting yet.</Empty> : (
+              <>
+                <div className="stackbar" role="img" aria-label={`Risk: ${levels.low} low, ${levels.elevated} elevated, ${levels.high} high, ${levels.breached} breached`}>
+                  {([['low', 'var(--ok)'], ['elevated', 'var(--warn)'], ['high', 'var(--crit)'], ['breached', '#7f1d1d']] as const).map(([k, c]) => levels[k] > 0 && (
+                    <i key={k} style={{ flex: levels[k], background: c }} title={`${k}: ${levels[k]}`} />
+                  ))}
+                </div>
+                <div className="legend" style={{ marginTop: 10 }}>
+                  {(['low', 'elevated', 'high', 'breached'] as const).map((k) => <span key={k}><b>{levels[k]}</b>&nbsp;{k}</span>)}
+                </div>
+              </>
             )}
           </Card>
 

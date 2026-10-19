@@ -1,6 +1,12 @@
-import { Pool } from 'pg';
+import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import { Pool, types } from 'pg';
 import { config } from './config';
 import { camelize, hashKey } from './util';
+
+// bigint columns (BIGSERIAL ids, counts) come back as numbers rather than strings; they stay far below 2^53
+types.setTypeParser(20, (v) => Number(v));
 
 export const pool = new Pool({ connectionString: config.databaseUrl });
 
@@ -14,104 +20,70 @@ export async function q1<T = any>(text: string, params: unknown[] = []): Promise
   return (await q<T>(text, params))[0];
 }
 
-const SCHEMA = `
-CREATE TABLE IF NOT EXISTS devices (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  name TEXT NOT NULL UNIQUE,
-  type TEXT NOT NULL,
-  location TEXT NOT NULL DEFAULT 'Unassigned',
-  ip_address TEXT,
-  firmware_version TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'offline' CHECK (status IN ('online','offline','degraded')),
-  api_key TEXT UNIQUE,          -- legacy plaintext column, emptied by migrate()
-  api_key_hash TEXT UNIQUE,     -- SHA-256 of the device key; the raw key is shown once
-  simulated BOOLEAN NOT NULL DEFAULT FALSE,
-  last_seen TIMESTAMPTZ,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+/** Optional capabilities that depend on what the database offers. */
+export const features = { knowledgeBase: false };
 
-CREATE TABLE IF NOT EXISTS users (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  email TEXT NOT NULL UNIQUE,
-  name TEXT NOT NULL,
-  password_hash TEXT NOT NULL,
-  role TEXT NOT NULL DEFAULT 'viewer' CHECK (role IN ('admin','viewer')),
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+const MIGRATIONS_DIR = path.join(__dirname, '..', 'migrations');
+const LOCK_KEY = 727274; // arbitrary constant: only one process may migrate at a time
 
-CREATE TABLE IF NOT EXISTS telemetry (
-  id BIGSERIAL PRIMARY KEY,
-  device_id UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
-  ts TIMESTAMPTZ NOT NULL DEFAULT now(),
-  temperature REAL, cpu REAL, memory REAL, battery REAL, signal REAL
-);
-CREATE INDEX IF NOT EXISTS telemetry_device_ts ON telemetry (device_id, ts DESC);
+export interface MigrationResult { applied: string[]; skipped: string[] }
 
-CREATE TABLE IF NOT EXISTS rules (
-  id SERIAL PRIMARY KEY,
-  metric TEXT NOT NULL,
-  operator TEXT NOT NULL CHECK (operator IN ('>','<')),
-  threshold REAL NOT NULL,
-  severity TEXT NOT NULL CHECK (severity IN ('warning','critical')),
-  enabled BOOLEAN NOT NULL DEFAULT TRUE,
-  UNIQUE (metric, severity)
-);
+/**
+ * Versioned SQL migrations (backend/migrations/NNN_name.sql), applied in order and recorded in
+ * `schema_migrations`. A file starting with `-- requires: <extension>` is skipped, with a warning,
+ * when that PostgreSQL extension is not installed; it is retried on the next start.
+ */
+export async function migrate(): Promise<MigrationResult> {
+  const result: MigrationResult = { applied: [], skipped: [] };
+  const client = await pool.connect();
+  try {
+    await client.query('SELECT pg_advisory_lock($1)', [LOCK_KEY]);
+    await client.query(`CREATE TABLE IF NOT EXISTS schema_migrations (
+      version TEXT PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
+    const done = new Map<string, string>(
+      (await client.query('SELECT version, checksum FROM schema_migrations')).rows.map((r) => [r.version, r.checksum]),
+    );
 
-CREATE TABLE IF NOT EXISTS alerts (
-  id SERIAL PRIMARY KEY,
-  device_id UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
-  type TEXT NOT NULL CHECK (type IN ('threshold','heartbeat','predictive')),
-  severity TEXT NOT NULL CHECK (severity IN ('info','warning','critical')),
-  metric TEXT,
-  message TEXT NOT NULL,
-  value REAL,
-  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','acknowledged','resolved')),
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  resolved_at TIMESTAMPTZ
-);
-CREATE INDEX IF NOT EXISTS alerts_status ON alerts (status, created_at DESC);
-CREATE INDEX IF NOT EXISTS alerts_device ON alerts (device_id, type);
+    const files = fs.readdirSync(MIGRATIONS_DIR).filter((f) => /^\d+_.+\.sql$/.test(f)).sort();
+    for (const file of files) {
+      const sql = fs.readFileSync(path.join(MIGRATIONS_DIR, file), 'utf8');
+      const version = file.split('_')[0];
+      const checksum = crypto.createHash('sha256').update(sql).digest('hex');
+      if (done.has(version)) {
+        if (done.get(version) !== checksum) console.warn(`[migrate] ${file} changed after it was applied - create a new migration instead of editing old ones`);
+        continue;
+      }
+      const needs = /^--\s*requires:\s*(\w+)/m.exec(sql)?.[1];
+      if (needs) {
+        const available = await client.query('SELECT 1 FROM pg_available_extensions WHERE name=$1', [needs]);
+        if (!available.rowCount) {
+          console.warn(`[migrate] skipping ${file}: PostgreSQL extension "${needs}" is not installed (knowledge base / assistant disabled)`);
+          result.skipped.push(file);
+          continue;
+        }
+      }
+      await client.query('BEGIN');
+      try {
+        await client.query(sql);
+        await client.query('INSERT INTO schema_migrations (version, name, checksum) VALUES ($1,$2,$3)', [version, file, checksum]);
+        await client.query('COMMIT');
+        result.applied.push(file);
+      } catch (e) {
+        await client.query('ROLLBACK');
+        throw new Error(`Migration ${file} failed: ${(e as Error).message}`);
+      }
+    }
+  } finally {
+    await client.query('SELECT pg_advisory_unlock($1)', [LOCK_KEY]).catch(() => undefined);
+    client.release();
+  }
 
-CREATE TABLE IF NOT EXISTS firmware_releases (
-  id SERIAL PRIMARY KEY,
-  device_type TEXT NOT NULL,
-  version TEXT NOT NULL,
-  notes TEXT NOT NULL DEFAULT '',
-  security_patch BOOLEAN NOT NULL DEFAULT FALSE,
-  released_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (device_type, version)
-);
-
-CREATE TABLE IF NOT EXISTS firmware_updates (
-  id SERIAL PRIMARY KEY,
-  device_id UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
-  from_version TEXT NOT NULL,
-  to_version TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'in_progress' CHECK (status IN ('in_progress','completed','failed')),
-  progress INT NOT NULL DEFAULT 0,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS security_incidents (
-  id SERIAL PRIMARY KEY,
-  device_id UUID REFERENCES devices(id) ON DELETE SET NULL,
-  category TEXT NOT NULL,
-  severity TEXT NOT NULL CHECK (severity IN ('low','medium','high','critical')),
-  description TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','investigating','resolved')),
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-`;
-
-export async function migrate() {
-  await pool.query(SCHEMA);
-  // upgrade databases created before hashed keys: hash any plaintext key, then drop the plaintext
-  await pool.query('ALTER TABLE devices ADD COLUMN IF NOT EXISTS api_key_hash TEXT UNIQUE');
-  await pool.query('ALTER TABLE devices ALTER COLUMN api_key DROP NOT NULL');
+  // data fix for databases created before device keys were hashed: hash any plaintext key, then drop it
   const legacy = await pool.query('SELECT id, api_key FROM devices WHERE api_key IS NOT NULL');
   for (const r of legacy.rows) {
     await pool.query('UPDATE devices SET api_key_hash=$2, api_key=NULL WHERE id=$1', [r.id, hashKey(r.api_key)]);
   }
+
+  features.knowledgeBase = !!(await pool.query("SELECT to_regclass('public.kb_chunks') AS t")).rows[0].t;
+  return result;
 }

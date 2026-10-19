@@ -1,5 +1,7 @@
 import { q, q1 } from '../db';
 import { HttpError } from '../util';
+import { publish } from './events';
+import { recordMaintenance } from './maintenance';
 
 /** Controlled (simulated) firmware rollout: progress ticks up, then the device version flips. */
 export async function startUpdate(deviceId: string, toVersion?: string) {
@@ -27,6 +29,7 @@ export async function startUpdate(deviceId: string, toVersion?: string) {
     `INSERT INTO firmware_updates (device_id, from_version, to_version) VALUES ($1,$2,$3) RETURNING *`,
     [deviceId, dev.firmwareVersion, target],
   );
+  publish('firmware', { deviceId });
   const willFail = Math.random() < 0.08; // simulated flaky flash
   let progress = 0;
   const timer = setInterval(async () => {
@@ -39,9 +42,11 @@ export async function startUpdate(deviceId: string, toVersion?: string) {
         clearInterval(timer);
         await q(`UPDATE firmware_updates SET status='completed', progress=100, updated_at=now() WHERE id=$1`, [upd!.id]);
         await q('UPDATE devices SET firmware_version=$2 WHERE id=$1', [deviceId, target]);
+        await recordMaintenance(deviceId, 'firmware', `Firmware updated ${dev.firmwareVersion} -> ${target}`, 'Controlled rollout completed successfully.');
       } else {
         await q('UPDATE firmware_updates SET progress=$2, updated_at=now() WHERE id=$1', [upd!.id, progress]);
       }
+      publish('firmware', { deviceId });
     } catch (e) {
       clearInterval(timer);
       console.error('[firmware]', e);
