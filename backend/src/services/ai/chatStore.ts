@@ -1,5 +1,6 @@
 import { q, q1 } from '../../db';
 import { HttpError } from '../../util';
+import { deviceBriefs } from '../deviceQueries';
 import { Source, ToolCall } from './rag';
 
 export interface ChatMessageRow {
@@ -11,20 +12,25 @@ export const MAX_MESSAGES_PER_CONVERSATION = 200;
 
 /** A conversation belongs to exactly one user. Others - administrators included - get a 404, never a peek. */
 export async function getConversation(userId: string, id: string) {
-  const row = await q1<any>(
-    `SELECT c.*, d.name AS device_name, d.asset_no FROM chat_conversations c LEFT JOIN devices d ON d.id = c.device_id WHERE c.id=$1 AND c.user_id=$2`,
-    [id, userId]).catch(() => undefined);
+  const row = await q1<any>('SELECT * FROM chat_conversations WHERE id=$1 AND user_id=$2', [id, userId]).catch(() => undefined);
   if (!row) throw new HttpError(404, 'Conversation not found');
-  return row;
+  return (await withDeviceNames([row]))[0];
+}
+
+/** The device a conversation is focused on is kept in MongoDB; attach its name and number. */
+async function withDeviceNames<T extends { deviceId?: string | null }>(rows: T[]): Promise<(T & { deviceName: string | null; assetNo: number | null })[]> {
+  const map = await deviceBriefs(rows.map((r) => r.deviceId ?? ''));
+  return rows.map((r) => ({ ...r, deviceName: r.deviceId ? map.get(r.deviceId)?.name ?? null : null, assetNo: r.deviceId ? map.get(r.deviceId)?.assetNo ?? null : null }));
 }
 
 export async function listConversations(userId: string) {
-  return q(
-    `SELECT c.id, c.title, c.device_id, d.name AS device_name, d.asset_no, c.created_at, c.updated_at,
+  const rows = await q(
+    `SELECT c.id, c.title, c.device_id, c.created_at, c.updated_at,
             (SELECT count(*)::int FROM chat_messages m WHERE m.conversation_id = c.id) AS message_count,
             (SELECT left(m.content, 120) FROM chat_messages m WHERE m.conversation_id = c.id ORDER BY m.id DESC LIMIT 1) AS preview
-       FROM chat_conversations c LEFT JOIN devices d ON d.id = c.device_id
+       FROM chat_conversations c
       WHERE c.user_id=$1 ORDER BY c.updated_at DESC LIMIT 100`, [userId]);
+  return withDeviceNames(rows);
 }
 
 export async function createConversation(userId: string, title?: string, deviceId?: string | null) {

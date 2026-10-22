@@ -1,4 +1,4 @@
-import { q } from '../db';
+import { col, toApiList } from '../mongo';
 import { MetricKey } from '../ml/metrics';
 
 export interface Rule {
@@ -17,7 +17,8 @@ let memo: { at: number; rows: Rule[] } | null = null;
 /** Every rule row (defaults and per-type overrides). */
 export async function getRules(): Promise<Rule[]> {
   if (memo && Date.now() - memo.at < 5000) return memo.rows;
-  const rows = await q<Rule>('SELECT * FROM rules ORDER BY metric, severity DESC, device_type NULLS FIRST');
+  const rows = toApiList<Rule>(await col('rules').find({}).toArray()).sort((a, b) =>
+    a.metric.localeCompare(b.metric) || b.severity.localeCompare(a.severity) || (a.deviceType ?? '').localeCompare(b.deviceType ?? ''));
   memo = { at: Date.now(), rows };
   return rows;
 }

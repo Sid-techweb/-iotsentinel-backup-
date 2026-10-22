@@ -33,6 +33,8 @@ function resolveJwtSecret(): string {
 export const config = {
   port: num('PORT', 4000),
   databaseUrl: str('DATABASE_URL', 'postgres://iot:iot@localhost:5433/iotmonitor'),
+  // PostgreSQL (databaseUrl) now holds only the knowledge base / assistant; everything else is in MongoDB.
+  mongoUrl: str('MONGO_URL', 'mongodb://iot:iot@localhost:27017/iotmonitor?authSource=admin'),
   redisUrl: str('REDIS_URL', 'redis://localhost:6379'),
   simulator: (process.env.SIMULATOR ?? 'true') === 'true',
   simIntervalMs,

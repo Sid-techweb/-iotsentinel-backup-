@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { pool } from '../../src/db';
+import { col } from '../../src/mongo';
 import { AIProviderError } from '../../src/services/ai/provider';
 import { DeterministicTestProvider } from '../../src/services/ai/testProvider';
 import { drainQueue } from '../../src/services/kb/ingest';
@@ -99,12 +99,12 @@ describe('assistant: live data questions (read-only tools)', () => {
     for (const id of done.cited) expect(done.sources.find((s: any) => s.id === id)).toBeTruthy();
 
     const audits = await eventually(async () => {
-      const r = await pool.query(`SELECT details FROM audit_logs WHERE action='assistant.tool' AND entity_id=$1`, [c.id]);
-      return r.rowCount ? r : false;
+      const r = await col('audit_logs').find({ action: 'assistant.tool', entityId: c.id }).toArray();
+      return r.length ? r : false;
     });
-    expect(audits.rowCount).toBeGreaterThan(0);
+    expect(audits.length).toBeGreaterThan(0);
     // the audit trail records which tool ran - never the question text
-    expect(JSON.stringify(audits.rows)).not.toContain('currently online');
+    expect(JSON.stringify(audits)).not.toContain('currently online');
   });
 
   it('shows the saved answer with its sources when the conversation is reopened', async () => {
@@ -231,5 +231,29 @@ describe('assistant: relevance', () => {
     expect(done.cited).toEqual([]);
     expect(done.text).toMatch(/couldn't find|could not find|no information|not find/i);
     expect(DeterministicTestProvider.lastMessages).toEqual([]);
+  });
+
+  it('says it is not in the file - and never falls back to live data or the model - when a question about an uploaded file has no match', async () => {
+    const tag = uid();
+    await uploadText(alice.token, `devices-${tag}.txt`, `Device register ${tag}: pump-01 is running, gateway-02 is offline.`);
+    const c = await newChat(alice.token);
+    DeterministicTestProvider.lastMessages = [];
+    const r = await ask(alice.token, c.id, 'In the devices file that I sent, what is a cell?');
+    const done = r.events.at(-1)!.data;
+    expect(done.text).toMatch(/not in the file/i);
+    expect(done.cited).toEqual([]);
+    expect(r.events[0].data.toolCalls).toEqual([]);                       // no live data was read
+    expect(DeterministicTestProvider.lastMessages).toEqual([]);
+  });
+
+  it('answers a question about an uploaded file from that file, with its citation', async () => {
+    const tag = uid();
+    const docId = await uploadText(alice.token, `register-${tag}.txt`, `Asset register ${tag}: the compressor valve inspection interval is every 90 days.`);
+    const c = await newChat(alice.token);
+    const r = await ask(alice.token, c.id, `According to the file I uploaded, what is the compressor valve inspection interval ${tag}?`);
+    const meta = r.events[0].data;
+    expect(meta.toolCalls).toEqual([]);
+    expect(meta.sources.every((s: any) => s.type === 'document')).toBe(true);
+    expect(meta.sources.some((s: any) => s.document?.id === docId)).toBe(true);
   });
 });

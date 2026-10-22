@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { pool } from '../../src/db';
+import { col } from '../../src/mongo';
 import { api, bearer, bootstrap, newUser, uid } from '../helpers';
 
 beforeAll(bootstrap);
@@ -29,9 +29,9 @@ describe('authentication', () => {
 
   it('never stores or returns the plain password', async () => {
     const { email } = await newUser('viewer');
-    const row = (await pool.query('SELECT password_hash FROM users WHERE email=$1', [email])).rows[0];
-    expect(row.password_hash).toMatch(/^\$2[aby]\$/); // bcrypt
-    expect(row.password_hash).not.toContain('test-password-1');
+    const row = (await col('users').findOne({ email }))!;
+    expect(row.passwordHash).toMatch(/^\$2[aby]\$/); // bcrypt
+    expect(row.passwordHash).not.toContain('test-password-1');
   });
 
   it('changes the password only when the current one is right', async () => {

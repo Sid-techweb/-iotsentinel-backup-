@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { Pool, types } from 'pg';
 import { config } from './config';
-import { camelize, hashKey } from './util';
+import { camelize } from './util';
 
 // bigint columns (BIGSERIAL ids, counts) come back as numbers rather than strings; they stay far below 2^53
 types.setTypeParser(20, (v) => Number(v));
@@ -76,12 +76,6 @@ export async function migrate(): Promise<MigrationResult> {
   } finally {
     await client.query('SELECT pg_advisory_unlock($1)', [LOCK_KEY]).catch(() => undefined);
     client.release();
-  }
-
-  // data fix for databases created before device keys were hashed: hash any plaintext key, then drop it
-  const legacy = await pool.query('SELECT id, api_key FROM devices WHERE api_key IS NOT NULL');
-  for (const r of legacy.rows) {
-    await pool.query('UPDATE devices SET api_key_hash=$2, api_key=NULL WHERE id=$1', [r.id, hashKey(r.api_key)]);
   }
 
   features.knowledgeBase = !!(await pool.query("SELECT to_regclass('public.kb_chunks') AS t")).rows[0].t;

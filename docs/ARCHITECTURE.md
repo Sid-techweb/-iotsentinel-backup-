@@ -3,8 +3,8 @@
 IoT Sentinel monitors the health and security of IoT / industrial devices, predicts threshold breaches before they happen, and
 answers maintenance questions from live platform data and uploaded documents.
 
-**Stack (mandatory):** React + TypeScript (Vite) · Node.js + Express.js (TypeScript) · PostgreSQL · Redis · REST API · Docker · Git/GitHub.
-**Added for the AI work:** pgvector (PostgreSQL extension), Ollama (local models), PDF / DOCX / CSV parsers, pdfkit (report PDFs), Vitest + Supertest + Testing Library.
+**Stack:** React + TypeScript (Vite) · Node.js + Express.js (TypeScript) · **MongoDB** (operational data) · **PostgreSQL + pgvector** (the RAG part) · Redis · REST API · Docker · Git/GitHub.
+**Added for the AI work:** pgvector (PostgreSQL extension; only the knowledge base and chats use PostgreSQL), Ollama (local models), PDF / DOCX / CSV parsers, pdfkit (report PDFs), Vitest + Supertest + Testing Library.
 
 ## Component view
 
@@ -19,15 +19,15 @@ answers maintenance questions from live platform data and uploaded documents.
 └──────────────┘        │ anomaly (predictor, versions, explanations) · reports · audit                    │
                         │ knowledge (upload, ingestion queue, hybrid retrieval)                            │
                         │ assistant (planner → read-only tools + retrieval → grounded prompt → stream)     │
-                        └────┬───────────────────┬──────────────────────────────┬─────────────────────────┘
-                             │                   │                              │
-                  ┌──────────▼────────┐  ┌───────▼───────┐             ┌────────▼──────────┐
-                  │ PostgreSQL 16     │  │ Redis         │             │ Ollama (local)    │
-                  │ + pgvector        │  │ heartbeats,   │             │ chat model +      │
-                  │ relational data,  │  │ rolling window│             │ embedding model   │
-                  │ vectors, FTS      │  │ caches, rate  │             │ (no data leaves   │
-                  └───────────────────┘  │ limits, pubsub│             │  the machine)     │
-                                         └───────────────┘             └───────────────────┘
+                        └───┬───────────────┬───────────────────┬────────────────────┬────────────────────┘
+                            │               │                   │                    │
+                    ┌───────▼───────┐ ┌─────▼───────────┐ ┌─────▼─────────┐ ┌────────▼──────────┐
+                    │ MongoDB 7     │ │ PostgreSQL 16   │ │ Redis         │ │ Ollama (local)    │
+                    │ users, devices│ │ + pgvector      │ │ heartbeats,   │ │ chat model +      │
+                    │ telemetry,    │ │ documents,      │ │ rolling window│ │ embedding model   │
+                    │ alerts, rules,│ │ chunks+vectors, │ │ caches, rate  │ │ (no data leaves   │
+                    │ audit, ...    │ │ chats           │ │ limits, pubsub│ │  the machine)     │
+                    └───────────────┘ └─────────────────┘ └───────────────┘ └───────────────────┘
 ```
 
 ## Request flows
@@ -53,7 +53,8 @@ against the labelled sources before the final message is stored.
 
 | Concern | Decision |
 |---|---|
-| Schema changes | Versioned SQL migrations (`backend/migrations`, `schema_migrations` with checksums, advisory lock). Existing data is never dropped. Migration 003 needs pgvector; without it the platform still runs with the assistant disabled |
+| Data split | Operational data in MongoDB (indexes created at start-up, telemetry expires through a TTL index); knowledge base and chats in PostgreSQL. Ids are shared (UUID users/devices) with no cross-database foreign keys - the app checks and resolves references |
+| Schema changes | MongoDB: indexes ensured at start-up. PostgreSQL: versioned SQL migrations (`backend/migrations`, `schema_migrations` with checksums, advisory lock); migration 003 needs pgvector, without it the platform still runs with the assistant disabled. Existing data is never dropped |
 | Authentication | JWT (12 h), bcrypt; devices use hashed API keys. The signing secret is `JWT_SECRET` or generated once and persisted in the data volume — never hard-coded |
 | Authorisation | Viewers are read-only server-side. Documents: owner / shared / admin predicate applied in list, search, download **and retrieval**. Conversations: owner only |
 | AI safety | The model never chooses tools or writes SQL; tools are fixed, read-only, bounded (time-out, row limits) and logged. Document text is untrusted data: wrapped in markers, with fake markers/citations neutralised, never placed in the system prompt |
@@ -68,8 +69,9 @@ against the labelled sources before the final message is stored.
 backend/src/{routes,services,ml,middleware}   API, domain logic, predictor
 backend/src/services/ai   provider abstraction (Ollama + a labelled test double), tool planner, tools, RAG, chat store
 backend/src/services/kb   extraction, chunking, ingestion queue, hybrid search
-backend/migrations        versioned SQL
-backend/tests             unit, API (real Postgres/Redis/pgvector), live-model tests (opt-in)
+backend/src/mongo.ts       MongoDB connection, ids, indexes
+backend/migrations        versioned SQL (PostgreSQL / RAG)
+backend/tests             unit, API (real MongoDB/Postgres/Redis/pgvector), live-model tests (opt-in)
 frontend/src              pages, components, API client, SSE client
 docker/postgres           PostgreSQL + pgvector image
 docs                      this documentation (also indexed for the assistant)

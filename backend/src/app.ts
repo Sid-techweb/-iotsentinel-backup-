@@ -5,6 +5,7 @@ import { ZodError } from 'zod';
 import { adminWrites, authenticate } from './auth';
 import { config } from './config';
 import { pool } from './db';
+import { pingMongo } from './mongo';
 import { byDeviceKey, rateLimit } from './middleware/rateLimit';
 import { redis } from './redis';
 import { alertsRouter } from './routes/alerts';
@@ -37,11 +38,13 @@ export function createApp() {
   app.use('/api', rateLimit({ name: 'api', max: config.apiRequestsPerMinute }));
 
   app.get('/api/health', async (_req, res) => {
-    const [db, cache] = await Promise.all([
+    const [mongoState, db, cache] = await Promise.all([
+      pingMongo().then(() => 'up', () => 'down'),
       pool.query('SELECT 1').then(() => 'up', () => 'down'),
       redis.ping().then(() => 'up', () => 'down'),
     ]);
-    res.status(db === 'up' && cache === 'up' ? 200 : 503).json({ status: db === 'up' && cache === 'up' ? 'ok' : 'degraded', postgres: db, redis: cache, simulator: config.simulator });
+    const ok = mongoState === 'up' && db === 'up' && cache === 'up';
+    res.status(ok ? 200 : 503).json({ status: ok ? 'ok' : 'degraded', mongo: mongoState, postgres: db, redis: cache, simulator: config.simulator });
   });
 
   // public: auth + device ingest (device keys). Everything below needs a signed-in user; writes need an admin.

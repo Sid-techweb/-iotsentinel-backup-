@@ -1,4 +1,5 @@
-import { q } from '../db';
+import { col, nextId, toApiList } from '../mongo';
+import { withDevice } from './deviceQueries';
 import { MetricForecast } from '../ml/predictor';
 import { redis } from '../redis';
 
@@ -17,28 +18,23 @@ export async function recordPredictions(deviceId: string, forecasts: MetricForec
     if (!first) continue;
     const { forecast: _curve, explanation, ...rest } = f;
     void _curve; void rest;
-    await q(
-      `INSERT INTO prediction_history (device_id, metric, probability, level, seconds_to_breach, threshold, current_value, slope_per_min,
-                                       model_scope, model_version, model_source, explanation)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb)`,
-      [deviceId, f.metric, f.probability, f.level, f.secondsToBreach, f.threshold, f.current, f.slopePerMin,
-        explanation.model.scope, explanation.model.version, explanation.model.source, JSON.stringify(explanation)],
-    );
+    await col('prediction_history').insertOne({
+      _id: (await nextId('prediction_history')) as any, deviceId, metric: f.metric, probability: f.probability, level: f.level,
+      secondsToBreach: f.secondsToBreach, threshold: f.threshold, currentValue: f.current, slopePerMin: f.slopePerMin,
+      modelScope: explanation.model.scope, modelVersion: explanation.model.version, modelSource: explanation.model.source,
+      explanation: JSON.parse(JSON.stringify(explanation)), createdAt: new Date(),
+    });
   }
 }
 
 export interface HistoryFilter { deviceId?: string; metric?: string; before?: number; limit?: number }
 
 export async function listPredictionHistory(f: HistoryFilter) {
-  const where: string[] = [];
-  const params: unknown[] = [];
-  if (f.deviceId) { params.push(f.deviceId); where.push(`h.device_id = $${params.length}`); }
-  if (f.metric) { params.push(f.metric); where.push(`h.metric = $${params.length}`); }
-  if (f.before) { params.push(f.before); where.push(`h.id < $${params.length}`); }
+  const filter: Record<string, unknown> = {};
+  if (f.deviceId) filter.deviceId = f.deviceId;
+  if (f.metric) filter.metric = f.metric;
+  if (f.before) filter._id = { $lt: f.before };
   const limit = Math.min(Math.max(f.limit ?? 50, 1), 500);
-  return q(
-    `SELECT h.id, h.device_id, d.name AS device_name, d.asset_no, d.type AS device_type, h.metric, h.probability, h.level, h.seconds_to_breach,
-            h.threshold, h.current_value, h.slope_per_min, h.model_scope, h.model_version, h.model_source, h.explanation, h.created_at
-       FROM prediction_history h JOIN devices d ON d.id = h.device_id
-      ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY h.id DESC LIMIT ${limit}`, params);
+  const rows = toApiList(await col('prediction_history').find(filter).sort({ _id: -1 }).limit(limit).toArray());
+  return withDevice(rows);
 }

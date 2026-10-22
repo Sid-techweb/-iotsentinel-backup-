@@ -3,22 +3,23 @@
 Centralised monitoring for IoT fleets: device health, firmware status and security incidents in one dashboard, plus a
 model that **predicts anomalies before they happen** (and explains why), plus a local **AI Maintenance Assistant** that answers questions from live data and your own documents - always with sources.
 
-**Stack:** React + TypeScript (Vite) · Node.js + Express.js (TypeScript) · PostgreSQL (+ pgvector) · Redis · REST API · Docker · Git/GitHub
+**Stack:** React + TypeScript (Vite) · Node.js + Express.js (TypeScript) · **MongoDB** (operational data) · PostgreSQL + pgvector (the RAG part) · Redis · REST API · Docker · Git/GitHub
 **AI additions:** Ollama (local models, nothing leaves your machine) · PDF/DOCX/CSV parsers · pdfkit (report PDFs)
 
-[![CI](https://github.com/Sid-techweb/FSD-Project/actions/workflows/ci.yml/badge.svg)](https://github.com/Sid-techweb/FSD-Project/actions/workflows/ci.yml)
+[![CI](https://github.com/Sid-techweb/IoT-Sentinel/actions/workflows/ci.yml/badge.svg)](https://github.com/Sid-techweb/IoT-Sentinel/actions/workflows/ci.yml)
 
 ## Run it
 
 ```bash
-docker compose up -d --build      # postgres (pgvector) + redis + backend + frontend
+docker compose up -d --build      # mongodb + postgres (pgvector) + redis + backend + frontend
 ```
 
 | Service   | URL                                   |
 |-----------|---------------------------------------|
 | Dashboard | http://localhost:8080                 |
 | REST API  | http://localhost:4000/api             |
-| Postgres  | localhost:5433 (iot / iot), local only |
+| MongoDB   | localhost:27017 (iot / iot), local only |
+| Postgres  | localhost:5433 (iot / iot), local only - knowledge base and chats |
 
 **First run:** open the dashboard and choose *Create an account*. The first account on a fresh installation becomes the
 **administrator**; later sign-ups are read-only viewers until an admin promotes them (Users screen).
@@ -30,12 +31,12 @@ and starts the **device simulator**, so the dashboard is live immediately. Copy 
 Local development (infrastructure in Docker, apps with hot reload):
 
 ```bash
-docker compose up -d postgres redis
+docker compose up -d mongo postgres redis
 cd backend  && npm install && npm run dev      # http://localhost:4000
 cd frontend && npm install && npm run dev      # http://localhost:5173 (proxies /api)
 ```
 
-Tests (they use a throw-away `iotmonitor_test` database and Redis database 1 - never your data):
+Tests (they use throw-away `iotmonitor_test` databases in MongoDB and PostgreSQL plus Redis database 1 - never your data):
 
 ```bash
 cd backend  && npm test      # 176 tests (+3 opt-in live-model tests): model maths, API, auth, alerts, retraining, document parsing, RAG, assistant, reports
@@ -48,7 +49,8 @@ The AI assistant needs Ollama with a chat and an embedding model - see [docs/DEP
 ## Architecture
 
 ```
-IoT devices / simulator ──► REST API (Express) ──► PostgreSQL   inventory, telemetry, alerts, rules, firmware, incidents, users, models
+IoT devices / simulator ──► REST API (Express) ──► MongoDB      inventory, telemetry (TTL), alerts, rules, firmware, incidents, users, models, audit
+                                  │          ├──► PostgreSQL   knowledge base + chats (pgvector: embeddings, full-text, access control)
                                   │          ├──► Redis        heartbeat TTLs, latest state, rolling window, caches, rate limits, pub/sub
                                   │          └──► Webhooks     signed notifications to Slack / Discord / any HTTPS endpoint
                                   └── anomaly predictor (TypeScript) ──► predictive alerts

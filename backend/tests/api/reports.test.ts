@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { pool } from '../../src/db';
+import { col } from '../../src/mongo';
 import { ingest } from '../../src/services/ingest';
 import { api, bearer, bootstrap, eventually, newDevice, newUser, uid } from '../helpers';
 
@@ -20,7 +20,7 @@ beforeAll(async () => {
   viewer = await newUser('viewer');
   real = await newDevice(admin.token, type, `=SUM(1+1)-real-${uid()}`); // a name that spreadsheets would execute
   const s = await newDevice(admin.token, type, `sim-${uid()}`);
-  await pool.query('UPDATE devices SET simulated = true WHERE id = $1', [s.id]);
+  await col('devices').updateOne({ _id: s.id }, { $set: { simulated: true } });
   sim = s;
   for (let i = 0; i < 6; i++) {
     await ingest(real.id, { temperature: 40 + i, cpu: 30 + i });
@@ -160,14 +160,14 @@ describe('CSV export', () => {
 
   it('writes an audit entry for each export without storing any data', async () => {
     await get(admin.token, `/alert-history/csv?deviceId=${real.id}`).buffer(true).parse(binary);
-    const row = await eventually(async () => (await pool.query(`SELECT details FROM audit_logs WHERE action='report.export' AND entity_id='alert-history' ORDER BY id DESC LIMIT 1`)).rows[0]);
+    const row = await eventually(async () => col('audit_logs').find({ action: 'report.export', entityId: 'alert-history' }).sort({ _id: -1 }).limit(1).next());
     expect(row.details).toMatchObject({ format: 'csv', deviceId: real.id });
     expect(JSON.stringify(row.details)).not.toContain('message');
   });
 
   it('streams more rows than one batch without loading them all at once', async () => {
     const id = (await newDevice(admin.token, type, `bulk-${uid()}`)).id;
-    await pool.query(`INSERT INTO telemetry (device_id, ts, cpu) SELECT $1, now() - (g || ' seconds')::interval, 10 FROM generate_series(1, 4500) g`, [id]);
+    await col('telemetry').insertMany(Array.from({ length: 4500 }, (_, g) => ({ deviceId: id, ts: new Date(Date.now() - (g + 1) * 1000), cpu: 10 })));
     const res = await get(admin.token, `/telemetry-history/csv?deviceId=${id}`).buffer(true).parse(binary);
     const lines = csvText(res.body).trim().split('\r\n');
     expect(lines.length).toBe(4501);
@@ -189,7 +189,7 @@ describe('PDF export', () => {
 
   it('paginates long reports across several pages', async () => {
     const id = (await newDevice(admin.token, type, `pdf-bulk-${uid()}`)).id;
-    await pool.query(`INSERT INTO telemetry (device_id, ts, cpu) SELECT $1, now() - (g || ' seconds')::interval, 10 FROM generate_series(1, 300) g`, [id]);
+    await col('telemetry').insertMany(Array.from({ length: 300 }, (_, g) => ({ deviceId: id, ts: new Date(Date.now() - (g + 1) * 1000), cpu: 10 })));
     const res = await get(admin.token, `/telemetry-history/pdf?deviceId=${id}`).buffer(true).parse(binary);
     const pages = (res.body as Buffer).toString('latin1').match(/\/Type \/Page\b/g)?.length ?? 0;
     expect(pages).toBeGreaterThan(2);

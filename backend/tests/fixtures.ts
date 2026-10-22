@@ -1,4 +1,4 @@
-import { pool } from '../src/db';
+import { col } from '../src/mongo';
 
 /** Deterministic noise so tests never flake. */
 export function rng(seed: number) {
@@ -22,8 +22,5 @@ export async function storeOverheatingHistory(deviceId: string, readings = 3000,
     ts.push((now - (readings - i) * 2000) / 1000);
     temp.push(v + (r() - 0.5) * 0.6);
   }
-  await pool.query(
-    'INSERT INTO telemetry (device_id, ts, temperature) SELECT $1, to_timestamp(t.x), t.y FROM unnest($2::float8[], $3::float8[]) AS t(x, y)',
-    [deviceId, ts, temp],
-  );
+  await col('telemetry').insertMany(ts.map((t, i) => ({ deviceId, ts: new Date(t * 1000), temperature: temp[i] })));
 }

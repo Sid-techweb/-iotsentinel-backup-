@@ -2,11 +2,12 @@ import { Request, Response, Router } from 'express';
 import { z } from 'zod';
 import { config } from '../config';
 import { features, q } from '../db';
+import { col } from '../mongo';
 import { rateLimit } from '../middleware/rateLimit';
 import { redis } from '../redis';
 import { AIProviderError, getProvider } from '../services/ai/provider';
 import { appendMessage, autoTitle, ChatMessageRow, createConversation, deleteConversation, getConversation, listConversations, MAX_MESSAGES_PER_CONVERSATION, messagesOf, toMarkdown, updateConversation } from '../services/ai/chatStore';
-import { finalizeAnswer, prepareTurn, Source } from '../services/ai/rag';
+import { finalizeAnswer, NOT_IN_FILE_TEXT, prepareTurn, Source } from '../services/ai/rag';
 import { audit, ctxOf } from '../services/audit';
 import { asyncH, HttpError } from '../util';
 
@@ -35,7 +36,7 @@ assistantRouter.get('/health', asyncH(async (req, res) => {
   const [provider, docs, top] = await Promise.all([
     getProvider().health().catch((e: Error) => ({ ok: false, provider: config.llmProvider, error: e.message })),
     q<{ status: string; n: number }>('SELECT status, count(*)::int AS n FROM kb_documents GROUP BY status'),
-    q<any>(`SELECT asset_no FROM devices WHERE active AND status <> 'offline' ORDER BY asset_no LIMIT 1`),
+    col('devices').find({ active: { $ne: false }, status: { $ne: 'offline' } }, { projection: { assetNo: 1 } }).sort({ assetNo: 1 }).limit(1).toArray(),
   ]);
   const by = Object.fromEntries(docs.map((d) => [d.status, d.n]));
   res.json({
@@ -130,7 +131,14 @@ async function runTurn(req: Request, res: Response, convId: string, question: st
     error = controller.signal.aborted ? 'Stopped before the answer was complete' : e instanceof AIProviderError ? e.message : `The model failed: ${(e as Error).message}`;
   }
 
-  const final = prepared.kind === 'answer' ? finalizeAnswer(text, prepared.sources) : { text, cited: [] as string[], invalid: [] as string[], uncited: false, sources: prepared.sources as Source[] };
+  // a small model can occasionally return nothing at all: say so, so the user can retry instead of waiting
+  if (!error && prepared.kind === 'answer' && !text.trim()) error = 'The model returned an empty answer. Try again, or rephrase the question.';
+
+  let final = prepared.kind === 'answer' ? finalizeAnswer(text, prepared.sources) : { text, cited: [] as string[], invalid: [] as string[], uncited: false, sources: prepared.sources as Source[] };
+  // a question about the user's own file is only answered when the answer cites that file; otherwise say so plainly
+  if (prepared.docOnly && !error && prepared.kind === 'answer' && (final.cited.length === 0 || /^\W*not in the file/i.test(final.text))) {
+    final = { text: NOT_IN_FILE_TEXT, cited: [], invalid: [], uncited: false, sources: final.sources.map((s) => ({ ...s, cited: false })) };
+  }
   const saved = await appendMessage(conv.id, {
     role: 'assistant', content: final.text, sources: final.sources, toolCalls: prepared.toolCalls, model, latencyMs: Date.now() - started, error,
   });

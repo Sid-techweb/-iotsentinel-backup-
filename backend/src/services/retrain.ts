@@ -1,4 +1,4 @@
-import { pool, q, q1 } from '../db';
+import { col, nextId, toApi } from '../mongo';
 import { extract, HORIZON, WINDOW } from '../ml/features';
 import { METRIC_KEYS, METRICS } from '../ml/metrics';
 import { evaluate, Evaluation, fitLogistic, LabelledSample, loadModel, modelFor, registerModel, TrainedModel } from '../ml/model';
@@ -70,7 +70,7 @@ export async function retrain(scope: string, by = 'system'): Promise<RetrainResu
   const type = await getDeviceType(scope);
   if (!type) throw new HttpError(404, `Unknown machine type "${scope}"`);
   const limits = await predictionLimits(scope);
-  const devices = await q<{ id: string }>('SELECT id FROM devices WHERE type=$1', [scope]);
+  const devices = (await col('devices').find({ type: scope }, { projection: { _id: 1 } }).toArray()).map((d) => ({ id: d._id as unknown as string }));
   if (!devices.length) throw new HttpError(422, 'No devices of this machine type yet');
 
   const train: LabelledSample[] = [];
@@ -81,11 +81,9 @@ export async function retrain(scope: string, by = 'system'): Promise<RetrainResu
     for (const metric of type.metrics) {
       const threshold = limits[metric];
       if (threshold === undefined || !(METRIC_KEYS as readonly string[]).includes(metric)) continue;
-      // the column name comes from the METRIC_KEYS whitelist, never from user input
-      const rows = await q<{ ts: Date; v: number }>(
-        `SELECT ts, ${metric} AS v FROM telemetry WHERE device_id=$1 AND ${metric} IS NOT NULL ORDER BY ts DESC LIMIT ${MAX_READINGS}`,
-        [dev.id],
-      );
+      // the field name comes from the METRIC_KEYS whitelist (checked above), never from user input
+      const rows = (await col('telemetry').find({ deviceId: dev.id, [metric]: { $ne: null } }, { projection: { _id: 0, ts: 1, [metric]: 1 } })
+        .sort({ ts: -1 }).limit(MAX_READINGS).toArray()).map((r) => ({ ts: r.ts as Date, v: r[metric] as number }));
       rows.reverse();
       const { dir, range } = METRICS[metric];
       const samples = windowsFrom(rows.map((r) => r.v), rows.map((r) => new Date(r.ts).getTime()), dir, range, threshold);
@@ -117,16 +115,15 @@ export async function retrain(scope: string, by = 'system'): Promise<RetrainResu
       ? `Kept the previous model: the new one only reached AUC ${evaluation.auc.toFixed(2)} (needs ${MIN_AUC}).`
       : `Kept the previous model: it scores AUC ${previous.auc.toFixed(2)} on the same data, higher than the new ${evaluation.auc.toFixed(2)}.`;
 
-  const client = await pool.connect();
+  const nowIso = new Date();
   let versionNo = 1;
-  let model: TrainedModel;
-  try {
-    await client.query('BEGIN');
-    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`model-version:${scope}`]);
-    versionNo = ((await client.query('SELECT COALESCE(MAX(version),0)+1 AS v FROM model_versions WHERE scope=$1', [scope])).rows[0].v as number);
+  let model!: TrainedModel;
+  for (let attempt = 0; ; attempt++) {
+    const last = await col('model_versions').find({ scope }, { projection: { version: 1 } }).sort({ version: -1 }).limit(1).next();
+    versionNo = (last?.version ?? 0) + 1;
     model = {
       version: `v${versionNo}`,
-      trainedAt: new Date().toISOString(),
+      trainedAt: nowIso.toISOString(),
       scope,
       source: 'telemetry',
       featureNames: FEATURE_NAMES,
@@ -137,25 +134,23 @@ export async function retrain(scope: string, by = 'system'): Promise<RetrainResu
       testSize: test.length,
       evaluation,
     };
-    if (activated) await client.query('UPDATE model_versions SET is_active=false WHERE scope=$1 AND is_active', [scope]);
-    await client.query(
-      `INSERT INTO model_versions (scope, version, source, samples, evaluation, previous_evaluation, activated, is_active, reason, trained_by, model)
-       VALUES ($1,$2,'telemetry',$3,$4,$5,$6,$6,$7,$8,$9)`,
-      [scope, versionNo, tr.length + test.length, JSON.stringify(evaluation), JSON.stringify(previous), activated, reason, by, JSON.stringify(model)],
-    );
-    if (activated) {
-      await client.query(
-        `INSERT INTO models (scope, model, source, samples, trained_at) VALUES ($1,$2,'telemetry',$3, now())
-         ON CONFLICT (scope) DO UPDATE SET model=EXCLUDED.model, source='telemetry', samples=EXCLUDED.samples, trained_at=now()`,
-        [scope, JSON.stringify(model), tr.length + test.length],
-      );
+    try {
+      // inserted as inactive first: the unique "one active version per scope" index is respected while switching
+      await col('model_versions').insertOne({
+        _id: (await nextId('model_versions')) as any, scope, version: versionNo, source: 'telemetry', samples: tr.length + test.length,
+        evaluation: JSON.parse(JSON.stringify(evaluation)), previousEvaluation: JSON.parse(JSON.stringify(previous)), activated, isActive: false,
+        reason, trainedBy: by, model: JSON.parse(JSON.stringify(model)), trainedAt: nowIso,
+      });
+      break;
+    } catch (e) {
+      if ((e as { code?: number }).code === 11000 && attempt < 5) continue; // another retrain took this version number
+      throw e;
     }
-    await client.query('COMMIT');
-  } catch (e) {
-    await client.query('ROLLBACK');
-    throw e;
-  } finally {
-    client.release();
+  }
+  if (activated) {
+    await col('model_versions').updateMany({ scope, isActive: true }, { $set: { isActive: false } });
+    await col('model_versions').updateOne({ scope, version: versionNo }, { $set: { isActive: true } });
+    await col('models').updateOne({ _id: scope as any }, { $set: { model: JSON.parse(JSON.stringify(model)), source: 'telemetry', samples: tr.length + test.length, trainedAt: new Date() } }, { upsert: true });
   }
   if (activated) {
     registerModel(scope, model);
@@ -164,54 +159,44 @@ export async function retrain(scope: string, by = 'system'): Promise<RetrainResu
   return { scope, version: versionNo, activated, reason, samples: { train: tr.length, test: test.length, positives, purged }, evaluation, previous };
 }
 
-const versionColumns = 'id, scope, version, source, samples, evaluation, previous_evaluation, activated, is_active, reason, trained_by, trained_at';
+const versionView = (d: any): ModelVersionRow => { const { model: _m, ...rest } = toApi(d)!; return rest as ModelVersionRow; };
 
-export const listModelVersions = (scope: string) =>
-  q<ModelVersionRow>(`SELECT ${versionColumns} FROM model_versions WHERE scope=$1 ORDER BY version DESC`, [scope]);
+export const listModelVersions = async (scope: string) =>
+  (await col('model_versions').find({ scope }).sort({ version: -1 }).toArray()).map(versionView);
 
 /** Make an earlier, previously accepted version the active one again (rollback). */
 export async function activateModelVersion(scope: string, version: number): Promise<ModelVersionRow> {
-  const row = await q1<{ id: number; activated: boolean; model: TrainedModel; samples: number }>(
-    'SELECT id, activated, model, samples FROM model_versions WHERE scope=$1 AND version=$2', [scope, version]);
+  const row = await col('model_versions').findOne({ scope, version });
   if (!row) throw new HttpError(404, `Model version ${version} not found for ${scope}`);
   if (!row.activated) throw new HttpError(409, 'That version was rejected by the validation gate and cannot be activated');
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    await client.query('UPDATE model_versions SET is_active=false WHERE scope=$1 AND is_active', [scope]);
-    await client.query('UPDATE model_versions SET is_active=true WHERE id=$1', [row.id]);
-    if (scope !== 'global') {
-      await client.query(
-        `INSERT INTO models (scope, model, source, samples, trained_at) VALUES ($1,$2,'telemetry',$3, now())
-         ON CONFLICT (scope) DO UPDATE SET model=EXCLUDED.model, source='telemetry', samples=EXCLUDED.samples, trained_at=now()`,
-        [scope, JSON.stringify(row.model), row.samples],
-      );
-    }
-    await client.query('COMMIT');
-  } catch (e) {
-    await client.query('ROLLBACK');
-    throw e;
-  } finally {
-    client.release();
+  await col('model_versions').updateMany({ scope, isActive: true }, { $set: { isActive: false } });
+  await col('model_versions').updateOne({ _id: row._id }, { $set: { isActive: true } });
+  if (scope !== 'global') {
+    await col('models').updateOne({ _id: scope as any }, { $set: { model: row.model, source: 'telemetry', samples: row.samples, trainedAt: new Date() } }, { upsert: true });
   }
-  if (scope !== 'global') registerModel(scope, { ...row.model, scope });
+  if (scope !== 'global') registerModel(scope, { ...(row.model as TrainedModel), scope });
   publish('model', { scope });
-  return (await q1<ModelVersionRow>(`SELECT ${versionColumns} FROM model_versions WHERE id=$1`, [row.id]))!;
+  return versionView(await col('model_versions').findOne({ _id: row._id }));
 }
 
 /** Make sure the built-in global model appears as version 1 in the version history. */
 export async function ensureGlobalVersion() {
   const g = loadModel();
-  await q(
-    `INSERT INTO model_versions (scope, version, source, samples, evaluation, activated, is_active, reason, trained_by, model, trained_at)
-     VALUES ('global', 1, 'synthetic', $1, $2, true, true, 'Built-in model trained on synthetic episodes (npm run train)', 'system', $3, $4)
-     ON CONFLICT (scope, version) DO NOTHING`,
-    [g.trainSize + g.testSize, JSON.stringify(g.evaluation), JSON.stringify(g), g.trainedAt],
-  );
+  const exists = await col('model_versions').findOne({ scope: 'global', version: 1 }, { projection: { _id: 1 } });
+  if (exists) return;
+  try {
+    await col('model_versions').insertOne({
+      _id: (await nextId('model_versions')) as any, scope: 'global', version: 1, source: 'synthetic', samples: g.trainSize + g.testSize,
+      evaluation: JSON.parse(JSON.stringify(g.evaluation)), previousEvaluation: null, activated: true, isActive: true,
+      reason: 'Built-in model trained on synthetic episodes (npm run train)', trainedBy: 'system', model: JSON.parse(JSON.stringify(g)), trainedAt: new Date(g.trainedAt),
+    });
+  } catch (e) {
+    if ((e as { code?: number }).code !== 11000) throw e; // another instance created it first
+  }
 }
 
 /** Load models trained in earlier runs so predictions use them straight after a restart. */
 export async function loadStoredModels() {
-  const rows = await q<{ scope: string; model: TrainedModel }>('SELECT scope, model FROM models');
-  for (const r of rows) registerModel(r.scope, { ...r.model, scope: r.scope });
+  const rows = await col('models').find({}).toArray();
+  for (const r of rows) registerModel(r._id as unknown as string, { ...(r.model as TrainedModel), scope: r._id as unknown as string });
 }

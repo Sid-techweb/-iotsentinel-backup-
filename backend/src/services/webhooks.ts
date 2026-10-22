@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import dns from 'dns/promises';
 import net from 'net';
 import { config } from '../config';
-import { q, q1 } from '../db';
+import { col, nextId, toApi } from '../mongo';
 import { HttpError } from '../util';
 
 export const WEBHOOK_EVENTS = ['alert.critical', 'alert.predictive', 'incident.created'] as const;
@@ -69,12 +69,12 @@ export async function deliver(hook: Webhook, event: string, data: Record<string,
     error = e instanceof Error ? e.message : String(e);
   }
   const durationMs = Date.now() - started;
-  await q(
-    'INSERT INTO webhook_deliveries (webhook_id, event, ok, status_code, error, duration_ms) VALUES ($1,$2,$3,$4,$5,$6)',
-    [hook.id, event, ok, statusCode, error, durationMs],
-  ).catch(() => undefined);
-  // keep only the latest 100 deliveries per webhook
-  await q('DELETE FROM webhook_deliveries WHERE webhook_id=$1 AND id NOT IN (SELECT id FROM webhook_deliveries WHERE webhook_id=$1 ORDER BY id DESC LIMIT 100)', [hook.id]).catch(() => undefined);
+  await (async () => {
+    await col('webhook_deliveries').insertOne({ _id: (await nextId('webhook_deliveries')) as any, webhookId: hook.id, event, ok, statusCode, error, durationMs, createdAt: new Date() });
+    // keep only the latest 100 deliveries per webhook
+    const oldest = await col('webhook_deliveries').find({ webhookId: hook.id }).sort({ _id: -1 }).skip(100).limit(1).next();
+    if (oldest) await col('webhook_deliveries').deleteMany({ webhookId: hook.id, _id: { $lte: oldest._id } });
+  })().catch(() => undefined);
   return { ok, statusCode, error, durationMs };
 }
 
@@ -82,7 +82,7 @@ export async function deliver(hook: Webhook, event: string, data: Record<string,
 export function notify(event: WebhookEvent, data: Record<string, unknown>, summary: string) {
   void (async () => {
     try {
-      const hooks = await q<Webhook>('SELECT * FROM webhooks WHERE enabled AND $1 = ANY(events)', [event]);
+      const hooks = (await col('webhooks').find({ enabled: true, events: event }).toArray()).map((h) => toApi<Webhook>(h)!);
       await Promise.all(hooks.map((h) => deliver(h, event, data, summary)));
     } catch (e) {
       console.error('[webhooks]', e);
@@ -90,4 +90,4 @@ export function notify(event: WebhookEvent, data: Record<string, unknown>, summa
   })();
 }
 
-export const getWebhook = (id: number | string) => q1<Webhook>('SELECT * FROM webhooks WHERE id=$1', [id]);
+export const getWebhook = async (id: number | string) => toApi<Webhook>(await col('webhooks').findOne({ _id: Number(id) as any }));

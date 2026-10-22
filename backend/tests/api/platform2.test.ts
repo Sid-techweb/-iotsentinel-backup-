@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 import { migrate, pool } from '../../src/db';
+import { col } from '../../src/mongo';
 import { loadModel, scoreFeatures } from '../../src/ml/model';
 import { ingest } from '../../src/services/ingest';
 import { storeOverheatingHistory } from '../fixtures';
@@ -11,7 +12,7 @@ beforeAll(async () => { await bootstrap(); admin = await newUser('admin'); });
 describe('versioned migrations', () => {
   it('records each applied migration and applies nothing twice', async () => {
     const rows = (await pool.query('SELECT version, name, checksum FROM schema_migrations ORDER BY version')).rows;
-    expect(rows.map((r) => r.version)).toEqual(['001', '002', '003']);
+    expect(rows.map((r) => r.version)).toEqual(['001', '002', '003', '004']);
     expect(rows.every((r) => /^[0-9a-f]{64}$/.test(r.checksum))).toBe(true);
     const again = await migrate();
     expect(again.applied).toEqual([]);
@@ -50,7 +51,7 @@ describe('device activation', () => {
     // the history is kept, and the change is in the maintenance log and the audit log
     const log = (await api().get(`/api/devices/${dev.id}/maintenance`).set(bearer(admin.token))).body as any[];
     expect(log[0]).toMatchObject({ kind: 'activation', summary: expect.stringContaining('deactivated') });
-    expect((await pool.query("SELECT 1 FROM audit_logs WHERE action='device.deactivate' AND entity_id=$1", [dev.id])).rowCount).toBe(1);
+    expect(await col('audit_logs').countDocuments({ action: 'device.deactivate', entityId: dev.id })).toBe(1);
 
     const on = await api().patch(`/api/devices/${dev.id}`).set(bearer(admin.token)).send({ active: true });
     expect(on.body.active).toBe(true);
@@ -240,15 +241,15 @@ describe('model versions', () => {
       expect(card.version).toBe('v1');
     }
     expect((await api().post(`/api/anomaly/models/${encodeURIComponent(name)}/versions/99/activate`).set(bearer(admin.token))).status).toBe(404);
-    expect((await pool.query("SELECT 1 FROM audit_logs WHERE action='model.retrain' AND entity_id=$1", [name])).rowCount).toBeGreaterThanOrEqual(2);
+    expect(await col('audit_logs').countDocuments({ action: 'model.retrain', entityId: name })).toBeGreaterThanOrEqual(2);
   });
 
   it('refuses to activate a version that failed the validation gate', async () => {
     const name = `Rejected ${uid()}`;
     await api().post('/api/device-types').set(bearer(admin.token)).send({ name, metrics: ['temperature'] });
-    await pool.query(
-      `INSERT INTO model_versions (scope, version, source, samples, evaluation, activated, is_active, reason, model)
-       VALUES ($1, 1, 'telemetry', 100, '{"auc":0.55}', false, false, 'rejected in test', '{}')`, [name]);
+    await col('model_versions').insertOne({
+      _id: Date.now() as any, scope: name, version: 1, source: 'telemetry', samples: 100, evaluation: { auc: 0.55 }, activated: false, isActive: false, reason: 'rejected in test', model: {}, trainedAt: new Date(),
+    });
     const res = await api().post(`/api/anomaly/models/${encodeURIComponent(name)}/versions/1/activate`).set(bearer(admin.token));
     expect(res.status).toBe(409);
     expect(res.body.error).toMatch(/validation gate/);

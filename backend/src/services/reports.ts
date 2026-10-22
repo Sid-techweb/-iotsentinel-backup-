@@ -1,19 +1,18 @@
 import PDFDocument from 'pdfkit';
 import { Response } from 'express';
 import { config } from '../config';
-import { q, q1 } from '../db';
+import { col } from '../mongo';
+import { DeviceBrief, deviceBriefs } from './deviceQueries';
 import { csvBody, csvHeader } from '../util';
 import { listDocuments, Viewer } from './kb/store';
 
 /**
- * Reports. Every report is one SQL query (parameterised) plus column metadata, so the same definition drives the
+ * Reports. Every report is one MongoDB query (or aggregation) plus column metadata, so the same definition drives the
  * on-screen preview, the CSV export and the PDF export. Large reports are read in keyset-paginated batches and
  * streamed, so memory use does not grow with the number of rows.
  */
 export interface Filters { from: Date; to: Date; deviceId?: string; machineType?: string; includeSimulated: boolean }
 export type Col = { key: string; header: string; weight?: number; fmt?: 'time' | 'num1' | 'pct' | 'bool' };
-type Params = unknown[];
-interface Built { sql: string; params: Params; summary?: (f: Filters) => Promise<{ label: string; value: string | number }[]> }
 
 export interface ReportDef {
   id: string;
@@ -26,21 +25,7 @@ export interface ReportDef {
   columns: Col[];
   /** True when the rows describe devices (so simulated data can be marked). */
   hasSimulated: boolean;
-  build(f: Filters, viewer: Viewer): Built | null;
 }
-
-const ph = (params: Params, v: unknown) => { params.push(v); return `$${params.length}`; };
-
-/** Device-scope predicate shared by all device-related reports. */
-function deviceWhere(f: Filters, params: Params, alias = 'd'): string[] {
-  const w: string[] = [];
-  if (f.deviceId) w.push(`${alias}.id = ${ph(params, f.deviceId)}`);
-  if (f.machineType) w.push(`${alias}.type = ${ph(params, f.machineType)}`);
-  if (!f.includeSimulated) w.push(`${alias}.simulated = false`);
-  return w;
-}
-const range = (col: string, f: Filters, params: Params) => `${col} >= ${ph(params, f.from)} AND ${col} < ${ph(params, f.to)}`;
-const where = (parts: string[]) => (parts.length ? `WHERE ${parts.join(' AND ')}` : '');
 
 const DEVICE_COLS: Col[] = [
   { key: 'assetNo', header: 'Asset #', weight: 0.7 }, { key: 'deviceName', header: 'Device', weight: 1.6 }, { key: 'deviceType', header: 'Machine type', weight: 1.4 },
@@ -63,20 +48,6 @@ export const REPORTS: ReportDef[] = [
       ...METRICS.map((m) => ({ key: m, header: m[0].toUpperCase() + m.slice(1), weight: 0.8, fmt: 'num1' as const })),
       { key: 'riskLevel', header: 'Risk level', weight: 0.9 }, { key: 'riskMetric', header: 'Risk metric', weight: 0.9 }, { key: 'riskProbability', header: 'Risk %', weight: 0.7, fmt: 'pct' },
     ],
-    build(f) {
-      const params: Params = [];
-      const w = where(deviceWhere(f, params));
-      return {
-        params,
-        sql: `SELECT d.asset_no AS sort_key, d.asset_no, d.name AS device_name, d.type AS device_type, d.simulated, d.status, d.active, d.firmware_version AS firmware, d.last_seen,
-                     (SELECT count(*)::int FROM alerts a WHERE a.device_id = d.id AND a.status = 'open') AS open_alerts,
-                     ${METRICS.map((m) => `lt.${m}`).join(', ')}, p.level AS risk_level, p.metric AS risk_metric, p.probability AS risk_probability
-                FROM devices d
-                LEFT JOIN LATERAL (SELECT * FROM telemetry t WHERE t.device_id = d.id ORDER BY t.ts DESC LIMIT 1) lt ON true
-                LEFT JOIN LATERAL (SELECT level, metric, probability FROM prediction_history h WHERE h.device_id = d.id ORDER BY h.created_at DESC, h.probability DESC LIMIT 1) p ON true
-                ${w}`,
-      };
-    },
   },
   {
     id: 'telemetry-history',
@@ -85,15 +56,6 @@ export const REPORTS: ReportDef[] = [
     uses: ['range', 'device', 'machineType', 'simulated'],
     hasSimulated: true,
     columns: [{ key: 'ts', header: 'Time', weight: 1.7, fmt: 'time' }, ...DEVICE_COLS, ...METRICS.map((m) => ({ key: m, header: m[0].toUpperCase() + m.slice(1), weight: 0.8, fmt: 'num1' as const }))],
-    build(f) {
-      const params: Params = [];
-      const w = where([...deviceWhere(f, params), range('t.ts', f, params)]);
-      return {
-        params,
-        sql: `SELECT t.id AS sort_key, t.ts, d.asset_no, d.name AS device_name, d.type AS device_type, d.simulated, ${METRICS.map((m) => `t.${m}`).join(', ')}
-                FROM telemetry t JOIN devices d ON d.id = t.device_id ${w}`,
-      };
-    },
   },
   {
     id: 'alert-history',
@@ -106,16 +68,6 @@ export const REPORTS: ReportDef[] = [
       { key: 'metric', header: 'Metric', weight: 0.9 }, { key: 'value', header: 'Value', weight: 0.7, fmt: 'num1' }, { key: 'status', header: 'Status', weight: 0.9 },
       { key: 'minutesOpen', header: 'Minutes open', weight: 0.9, fmt: 'num1' }, { key: 'message', header: 'Message', weight: 3 },
     ],
-    build(f) {
-      const params: Params = [];
-      const w = where([...deviceWhere(f, params), range('a.created_at', f, params)]);
-      return {
-        params,
-        sql: `SELECT a.id AS sort_key, a.created_at, d.asset_no, d.name AS device_name, d.type AS device_type, d.simulated, a.type, a.severity, a.metric, a.value, a.status,
-                     round((extract(epoch FROM (COALESCE(a.resolved_at, now()) - a.created_at)) / 60)::numeric, 1)::float AS minutes_open, a.message
-                FROM alerts a JOIN devices d ON d.id = a.device_id ${w}`,
-      };
-    },
   },
   {
     id: 'predictive-summary',
@@ -129,22 +81,6 @@ export const REPORTS: ReportDef[] = [
       { key: 'avgProbability', header: 'Average risk %', weight: 0.9, fmt: 'pct' }, { key: 'elevatedSnapshots', header: 'Elevated or higher', weight: 1 }, { key: 'lastLevel', header: 'Latest level', weight: 0.9 },
       { key: 'soonestBreachSeconds', header: 'Soonest breach (s)', weight: 1, fmt: 'num1' }, { key: 'modelVersion', header: 'Model', weight: 1 }, { key: 'basis', header: 'Basis', weight: 0.9 },
     ],
-    build(f) {
-      const params: Params = [];
-      const w = where([...deviceWhere(f, params), range('h.created_at', f, params)]);
-      return {
-        params,
-        sql: `SELECT row_number() OVER (ORDER BY d.asset_no, h.metric) AS sort_key, d.asset_no, d.name AS device_name, d.type AS device_type, d.simulated, h.metric,
-                     count(*)::int AS snapshots, max(h.probability) AS max_probability, avg(h.probability) AS avg_probability,
-                     count(*) FILTER (WHERE h.level <> 'low')::int AS elevated_snapshots,
-                     (array_agg(h.level ORDER BY h.created_at DESC))[1] AS last_level,
-                     min(h.seconds_to_breach) AS soonest_breach_seconds,
-                     (array_agg(h.model_version ORDER BY h.created_at DESC))[1] AS model_version,
-                     (array_agg(h.model_source ORDER BY h.created_at DESC))[1] AS basis
-                FROM prediction_history h JOIN devices d ON d.id = h.device_id ${w}
-               GROUP BY d.id, d.asset_no, d.name, d.type, d.simulated, h.metric`,
-      };
-    },
   },
   {
     id: 'machine-type-comparison',
@@ -159,31 +95,6 @@ export const REPORTS: ReportDef[] = [
       { key: 'predictiveAlerts', header: 'Predictive', weight: 0.8 }, { key: 'alertsPerDevice', header: 'Alerts / device', weight: 0.9, fmt: 'num1' },
       { key: 'maintenance', header: 'Maintenance entries', weight: 1 }, { key: 'avgRisk', header: 'Avg peak risk %', weight: 1, fmt: 'pct' },
     ],
-    build(f) {
-      const params: Params = [];
-      const dw = where([...(f.machineType ? [`d.type = ${ph(params, f.machineType)}`] : []), ...(f.includeSimulated ? [] : ['d.simulated = false']), 'd.active']);
-      const from = ph(params, f.from); const to = ph(params, f.to);
-      return {
-        params,
-        sql: `SELECT row_number() OVER (ORDER BY d.type) AS sort_key, d.type AS machine_type, count(*)::int AS devices, count(*) FILTER (WHERE d.simulated)::int AS simulated_devices,
-                     count(*) FILTER (WHERE d.status = 'online')::int AS online, count(*) FILTER (WHERE d.status = 'degraded')::int AS degraded, count(*) FILTER (WHERE d.status = 'offline')::int AS offline,
-                     COALESCE(sum(x.alerts), 0)::int AS alerts, COALESCE(sum(x.critical), 0)::int AS critical,
-                     COALESCE(sum(x.threshold_alerts), 0)::int AS threshold_alerts, COALESCE(sum(x.predictive_alerts), 0)::int AS predictive_alerts,
-                     round((COALESCE(sum(x.alerts), 0)::numeric / NULLIF(count(*), 0)), 1)::float AS alerts_per_device,
-                     COALESCE(sum(x.maintenance), 0)::int AS maintenance, avg(x.peak) AS avg_risk
-                FROM devices d
-                LEFT JOIN LATERAL (
-                  SELECT (SELECT count(*) FROM alerts a WHERE a.device_id = d.id AND a.created_at >= ${from} AND a.created_at < ${to}) AS alerts,
-                         (SELECT count(*) FROM alerts a WHERE a.device_id = d.id AND a.severity = 'critical' AND a.created_at >= ${from} AND a.created_at < ${to}) AS critical,
-                         (SELECT count(*) FROM alerts a WHERE a.device_id = d.id AND a.type = 'threshold' AND a.created_at >= ${from} AND a.created_at < ${to}) AS threshold_alerts,
-                         (SELECT count(*) FROM alerts a WHERE a.device_id = d.id AND a.type = 'predictive' AND a.created_at >= ${from} AND a.created_at < ${to}) AS predictive_alerts,
-                         (SELECT count(*) FROM maintenance_records m WHERE m.device_id = d.id AND m.performed_at >= ${from} AND m.performed_at < ${to}) AS maintenance,
-                         (SELECT max(h.probability) FROM prediction_history h WHERE h.device_id = d.id AND h.created_at >= ${from} AND h.created_at < ${to}) AS peak
-                ) x ON true
-                ${dw}
-               GROUP BY d.type`,
-      };
-    },
   },
   {
     id: 'maintenance-history',
@@ -195,15 +106,6 @@ export const REPORTS: ReportDef[] = [
       { key: 'performedAt', header: 'When', weight: 1.7, fmt: 'time' }, ...DEVICE_COLS, { key: 'kind', header: 'Kind', weight: 1 },
       { key: 'summary', header: 'Summary', weight: 2.4 }, { key: 'details', header: 'Details', weight: 3 }, { key: 'performedByName', header: 'By', weight: 1.2 },
     ],
-    build(f) {
-      const params: Params = [];
-      const w = where([...deviceWhere(f, params), range('m.performed_at', f, params)]);
-      return {
-        params,
-        sql: `SELECT m.id AS sort_key, m.performed_at, d.asset_no, d.name AS device_name, d.type AS device_type, d.simulated, m.kind, m.summary, m.details, m.performed_by_name
-                FROM maintenance_records m JOIN devices d ON d.id = m.device_id ${w}`,
-      };
-    },
   },
   {
     id: 'model-performance',
@@ -219,16 +121,6 @@ export const REPORTS: ReportDef[] = [
       { key: 'isActive', header: 'Active', weight: 0.7, fmt: 'bool' }, { key: 'activated', header: 'Passed gate', weight: 0.9, fmt: 'bool' }, { key: 'reason', header: 'Reason', weight: 2.4 },
       { key: 'trainedBy', header: 'Trained by', weight: 1 }, { key: 'trainedAt', header: 'Trained', weight: 1.6, fmt: 'time' },
     ],
-    build() {
-      const params: Params = [];
-      return {
-        params,
-        sql: `SELECT id AS sort_key, scope, version, source, samples, (evaluation->>'auc')::float AS auc, (evaluation->>'precision')::float AS precision, (evaluation->>'recall')::float AS recall,
-                     (evaluation->>'f1')::float AS f1, (evaluation->>'brier')::float AS brier, (evaluation->>'positiveRate')::float AS positive_rate,
-                     is_active, activated, reason, trained_by, trained_at
-                FROM model_versions`,
-      };
-    },
   },
 ];
 
@@ -243,24 +135,179 @@ export const KB_COLUMNS: Col[] = [
 /* ------------------------------------------------------------------------------------------ running */
 
 const BATCH = 2000;
+type Row = Record<string, any>;
+interface Source {
+  /** Rows after `after` (the previous batch's last sortKey), in sortKey order. Every row carries its own `sortKey`. */
+  fetch(f: Filters, after: any, limit: number): Promise<Row[]>;
+  count(f: Filters): Promise<number>;
+}
 
-async function* batches(def: ReportDef, f: Filters, viewer: Viewer, maxRows: number): AsyncGenerator<Record<string, any>[]> {
+/** Devices matching the machine-type / single-device / simulated filters (null = no restriction). */
+function deviceFilter(f: Filters): Record<string, unknown> | null {
+  const w: Record<string, unknown> = {};
+  if (f.deviceId) w._id = f.deviceId;
+  if (f.machineType) w.type = f.machineType;
+  if (!f.includeSimulated) w.simulated = { $ne: true };
+  return Object.keys(w).length ? w : null;
+}
+
+async function scopeIds(f: Filters): Promise<string[] | null> {
+  const w = deviceFilter(f);
+  if (!w) return null;
+  return (await col('devices').find(w, { projection: { _id: 1 } }).toArray()).map((d) => d._id as string);
+}
+
+const deviceCols = (b?: DeviceBrief) => ({ assetNo: b?.assetNo ?? null, deviceName: b?.name ?? null, deviceType: b?.type ?? null, simulated: b?.simulated ?? false });
+const round1 = (n: number) => Math.round(n * 10) / 10;
+
+/** Event collections (telemetry, alerts, maintenance): filter by time and device scope, paginate by `_id`. */
+function eventSource(collection: string, timeField: string, shape: (r: Row, b: Map<string, DeviceBrief>) => Row): Source {
+  const base = async (f: Filters) => {
+    const filter: Record<string, unknown> = { [timeField]: { $gte: f.from, $lt: f.to } };
+    const ids = await scopeIds(f);
+    if (ids) filter.deviceId = { $in: ids };
+    return filter;
+  };
+  return {
+    async fetch(f, after, limit) {
+      const filter = await base(f);
+      if (after !== undefined && after !== null) filter._id = { $gt: after };
+      const rows = await col(collection).find(filter).sort({ _id: 1 }).limit(limit).toArray();
+      const briefs = await deviceBriefs(rows.map((r) => r.deviceId));
+      return rows.map((r) => ({ ...shape(r, briefs), sortKey: r._id }));
+    },
+    count: async (f) => col(collection).countDocuments(await base(f)),
+  };
+}
+
+const METRIC_LIST = ['temperature', 'cpu', 'memory', 'battery', 'signal', 'vibration', 'pressure', 'current'];
+const metricValues = (r: Row) => Object.fromEntries(METRIC_LIST.map((m) => [m, r[m] ?? null]));
+
+/** Small, aggregated reports are computed in one go and then sliced by position. */
+function computedSource(compute: (f: Filters) => Promise<Row[]>): Source {
+  return {
+    async fetch(f, after, limit) {
+      const all = (await compute(f)).map((r, i) => ({ ...r, sortKey: i + 1 }));
+      return all.filter((r) => r.sortKey > (after ?? 0)).slice(0, limit);
+    },
+    count: async (f) => (await compute(f)).length,
+  };
+}
+
+const SOURCES: Record<string, Source> = {
+  'telemetry-history': eventSource('telemetry', 'ts', (r, b) => ({ ts: r.ts, ...deviceCols(b.get(r.deviceId)), ...metricValues(r) })),
+  'alert-history': eventSource('alerts', 'createdAt', (r, b) => ({
+    createdAt: r.createdAt, ...deviceCols(b.get(r.deviceId)), type: r.type, severity: r.severity, metric: r.metric, value: r.value, status: r.status,
+    minutesOpen: round1(((r.resolvedAt ? new Date(r.resolvedAt).getTime() : Date.now()) - new Date(r.createdAt).getTime()) / 60_000), message: r.message,
+  })),
+  'maintenance-history': eventSource('maintenance_records', 'performedAt', (r, b) => ({
+    performedAt: r.performedAt, ...deviceCols(b.get(r.deviceId)), kind: r.kind, summary: r.summary, details: r.details, performedByName: r.performedByName,
+  })),
+
+  // one row per device, keyed by its asset number
+  'device-health': {
+    async fetch(f, after, limit) {
+      const filter: Record<string, unknown> = { ...deviceFilter(f), assetNo: { $gt: after ?? 0 } };
+      const devices = await col('devices').find(filter, { projection: { apiKeyHash: 0 } }).sort({ assetNo: 1 }).limit(limit).toArray();
+      const ids = devices.map((d) => d._id as string);
+      const open = await col('alerts').aggregate([{ $match: { deviceId: { $in: ids }, status: 'open' } }, { $group: { _id: '$deviceId', n: { $sum: 1 } } }]).toArray();
+      const openBy = new Map(open.map((o) => [o._id as string, o.n as number]));
+      return Promise.all(devices.map(async (d) => {
+        const [lt, p] = await Promise.all([
+          col('telemetry').find({ deviceId: d._id }).sort({ ts: -1 }).limit(1).next(),
+          col('prediction_history').find({ deviceId: d._id }).sort({ createdAt: -1, probability: -1 }).limit(1).next(),
+        ]);
+        return {
+          sortKey: d.assetNo, assetNo: d.assetNo, deviceName: d.name, deviceType: d.type, simulated: !!d.simulated, status: d.status, active: d.active !== false,
+          firmware: d.firmwareVersion, lastSeen: d.lastSeen, openAlerts: openBy.get(d._id as string) ?? 0, ...metricValues(lt ?? {}),
+          riskLevel: p?.level ?? null, riskMetric: p?.metric ?? null, riskProbability: p?.probability ?? null,
+        };
+      }));
+    },
+    count: async (f) => col('devices').countDocuments(deviceFilter(f) ?? {}),
+  },
+
+  'predictive-summary': computedSource(async (f) => {
+    const ids = await scopeIds(f);
+    const match: Record<string, unknown> = { createdAt: { $gte: f.from, $lt: f.to } };
+    if (ids) match.deviceId = { $in: ids };
+    const groups = await col('prediction_history').aggregate([
+      { $match: match },
+      { $sort: { createdAt: -1 } },
+      { $group: {
+        _id: { deviceId: '$deviceId', metric: '$metric' }, snapshots: { $sum: 1 }, maxProbability: { $max: '$probability' }, avgProbability: { $avg: '$probability' },
+        elevatedSnapshots: { $sum: { $cond: [{ $ne: ['$level', 'low'] }, 1, 0] } }, lastLevel: { $first: '$level' }, soonestBreachSeconds: { $min: '$secondsToBreach' },
+        modelVersion: { $first: '$modelVersion' }, basis: { $first: '$modelSource' },
+      } },
+    ]).toArray();
+    const briefs = await deviceBriefs(groups.map((g) => g._id.deviceId));
+    return groups
+      .map((g) => ({ ...deviceCols(briefs.get(g._id.deviceId)), metric: g._id.metric, snapshots: g.snapshots, maxProbability: g.maxProbability, avgProbability: g.avgProbability,
+        elevatedSnapshots: g.elevatedSnapshots, lastLevel: g.lastLevel, soonestBreachSeconds: g.soonestBreachSeconds ?? null, modelVersion: g.modelVersion, basis: g.basis }))
+      .sort((a, b) => (a.assetNo ?? 0) - (b.assetNo ?? 0) || String(a.metric).localeCompare(String(b.metric)));
+  }),
+
+  'machine-type-comparison': computedSource(async (f) => {
+    const filter: Record<string, unknown> = { active: { $ne: false } };
+    if (f.machineType) filter.type = f.machineType;
+    if (!f.includeSimulated) filter.simulated = { $ne: true };
+    const devices = await col('devices').find(filter, { projection: { type: 1, status: 1, simulated: 1 } }).toArray();
+    const ids = devices.map((d) => d._id as string);
+    const range = { $gte: f.from, $lt: f.to };
+    const [alertRows, maintRows, peakRows] = await Promise.all([
+      col('alerts').aggregate([{ $match: { deviceId: { $in: ids }, createdAt: range } }, { $group: { _id: { d: '$deviceId', t: '$type', s: '$severity' }, n: { $sum: 1 } } }]).toArray(),
+      col('maintenance_records').aggregate([{ $match: { deviceId: { $in: ids }, performedAt: range } }, { $group: { _id: '$deviceId', n: { $sum: 1 } } }]).toArray(),
+      col('prediction_history').aggregate([{ $match: { deviceId: { $in: ids }, createdAt: range } }, { $group: { _id: '$deviceId', peak: { $max: '$probability' } } }]).toArray(),
+    ]);
+    const typeOf = new Map(devices.map((d) => [d._id as string, d.type as string]));
+    const by = new Map<string, Row>();
+    const entry = (type: string) => {
+      if (!by.has(type)) by.set(type, { machineType: type, devices: 0, simulatedDevices: 0, online: 0, degraded: 0, offline: 0, alerts: 0, critical: 0, thresholdAlerts: 0, predictiveAlerts: 0, maintenance: 0, peaks: [] as number[] });
+      return by.get(type)!;
+    };
+    for (const d of devices) {
+      const e = entry(d.type);
+      e.devices++; if (d.simulated) e.simulatedDevices++;
+      if (d.status === 'online') e.online++; else if (d.status === 'degraded') e.degraded++; else if (d.status === 'offline') e.offline++;
+    }
+    for (const a of alertRows) {
+      const e = entry(typeOf.get(a._id.d)!);
+      e.alerts += a.n;
+      if (a._id.s === 'critical') e.critical += a.n;
+      if (a._id.t === 'threshold') e.thresholdAlerts += a.n;
+      if (a._id.t === 'predictive') e.predictiveAlerts += a.n;
+    }
+    for (const m of maintRows) entry(typeOf.get(m._id as string)!).maintenance += m.n;
+    for (const p of peakRows) entry(typeOf.get(p._id as string)!).peaks.push(p.peak);
+    return [...by.values()].sort((a, b) => a.machineType.localeCompare(b.machineType)).map(({ peaks, ...e }) => ({
+      ...e, alertsPerDevice: e.devices ? round1(e.alerts / e.devices) : null, avgRisk: peaks.length ? peaks.reduce((s: number, v: number) => s + v, 0) / peaks.length : null,
+    }));
+  }),
+
+  'model-performance': computedSource(async () => {
+    const versions = await col('model_versions').find({}, { projection: { model: 0 } }).sort({ _id: 1 }).toArray();
+    return versions.map((v) => ({
+      scope: v.scope, version: v.version, source: v.source, samples: v.samples, auc: v.evaluation?.auc ?? null, precision: v.evaluation?.precision ?? null, recall: v.evaluation?.recall ?? null,
+      f1: v.evaluation?.f1 ?? null, brier: v.evaluation?.brier ?? null, positiveRate: v.evaluation?.positiveRate ?? null, isActive: !!v.isActive, activated: !!v.activated,
+      reason: v.reason, trainedBy: v.trainedBy, trainedAt: v.trainedAt,
+    }));
+  }),
+};
+
+async function* batches(def: ReportDef, f: Filters, viewer: Viewer, maxRows: number): AsyncGenerator<Row[]> {
   if (def.id === 'knowledge-base') {
-    const docs = await listDocuments(viewer, {});
-    yield docs.slice(0, maxRows);
+    yield (await listDocuments(viewer, {})).slice(0, maxRows);
     return;
   }
-  const built = def.build(f, viewer);
-  if (!built) return;
-  let last = 0;
+  const src = SOURCES[def.id];
+  if (!src) return;
+  let last: any;
   let sent = 0;
   while (sent < maxRows) {
-    const params = [...built.params, last, Math.min(BATCH, maxRows - sent)];
-    const rows = await q(
-      `SELECT * FROM (${built.sql}) r WHERE sort_key > $${built.params.length + 1} ORDER BY sort_key LIMIT $${built.params.length + 2}`, params);
+    const rows = await src.fetch(f, last, Math.min(BATCH, maxRows - sent));
     if (!rows.length) return;
     sent += rows.length;
-    last = Number(rows[rows.length - 1].sortKey);
+    last = rows[rows.length - 1].sortKey;
     yield rows;
     if (rows.length < Math.min(BATCH, maxRows)) return;
   }
@@ -268,24 +315,21 @@ async function* batches(def: ReportDef, f: Filters, viewer: Viewer, maxRows: num
 
 export const KNOWLEDGE_REPORT: ReportDef = {
   id: 'knowledge-base', title: 'Knowledge base inventory', description: 'The documents you can read, their indexing status and visibility.', uses: [],
-  hasSimulated: false, columns: KB_COLUMNS, build: () => null,
+  hasSimulated: false, columns: KB_COLUMNS,
 };
 export const ALL_REPORTS: ReportDef[] = [...REPORTS, KNOWLEDGE_REPORT];
 export const findReport = (id: string) => ALL_REPORTS.find((r) => r.id === id);
 
 async function count(def: ReportDef, f: Filters, viewer: Viewer): Promise<number> {
   if (def.id === 'knowledge-base') return (await listDocuments(viewer, {})).length;
-  const built = def.build(f, viewer);
-  if (!built) return 0;
-  return Number((await q1<{ n: string }>(`SELECT count(*) AS n FROM (${built.sql}) r`, built.params))?.n ?? 0);
+  return SOURCES[def.id]?.count(f) ?? 0;
 }
 
 /** Devices matched by the filters, and how many of them are simulated - so reports can say what they include. */
 export async function scopeInfo(f: Filters) {
-  const params: Params = [];
-  const w = where(deviceWhere(f, params));
-  const r = await q1<{ total: number; simulated: number }>(`SELECT count(*)::int AS total, count(*) FILTER (WHERE d.simulated)::int AS simulated FROM devices d ${w}`, params);
-  return { devices: r?.total ?? 0, simulatedDevices: r?.simulated ?? 0 };
+  const w = deviceFilter(f) ?? {};
+  const [devices, simulatedDevices] = await Promise.all([col('devices').countDocuments(w), col('devices').countDocuments({ ...w, simulated: true })]);
+  return { devices, simulatedDevices };
 }
 
 export interface Preview {

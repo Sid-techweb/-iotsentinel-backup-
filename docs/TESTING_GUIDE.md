@@ -8,19 +8,19 @@ GitHub Actions runs the same suites but had not yet run at the time of writing â
 | Layer | Where | What it covers | Needs |
 |---|---|---|---|
 | Backend unit | `backend/tests/unit` | Prediction maths and evaluation, utilities, **document parsing, chunking, upload validation, zip-bomb refusal, prompt safety, citation verification** | nothing |
-| Backend API | `backend/tests/api` | Auth and roles, devices, alerts, rules, retraining and versions, webhooks, platform behaviour, **assistant (conversations, streaming, tools, access control, prompt injection, failure handling), reports (all types, CSV/PDF, streaming, simulated marking, injection guard)** | PostgreSQL with pgvector, Redis |
+| Backend API | `backend/tests/api` | (runs against real MongoDB, PostgreSQL + pgvector and Redis) Auth and roles, devices, alerts, rules, retraining and versions, webhooks, platform behaviour, **assistant (conversations, streaming, tools, access control, prompt injection, failure handling), reports (all types, CSV/PDF, streaming, simulated marking, injection guard)** | MongoDB, PostgreSQL with pgvector, Redis |
 | Live model | `backend/tests/live` | Real Ollama: grounded, cited answer; planted instruction not obeyed; off-topic question | Ollama + models, `RUN_LIVE_LLM=1` |
 | Frontend | `frontend/tests` | Formatting, SSE parser, sign-in, rules screen, **Markdown renderer (no HTML injection), streamed answers and citations, retry/error/offline states, document upload validation, delete confirmation, reports page** | nothing (jsdom) |
-| End-to-end | `e2e/` | The 13-step story in a real browser against the real API | Postgres + Redis, Chrome |
+| End-to-end | `e2e/` | The 13-step story in a real browser against the real API | MongoDB, Postgres, Redis, Chrome |
 
 ## Running
 
 ```bash
-docker compose up -d postgres redis        # the API tests use real PostgreSQL (pgvector) and Redis
+docker compose up -d mongo postgres redis  # the API tests use real MongoDB, PostgreSQL (pgvector) and Redis
 
 cd backend
 npm run typecheck && npm run lint
-npm test                                   # creates and drops its own database `iotmonitor_test` and uses Redis db 1
+npm test                                   # recreates its own databases `iotmonitor_test` (MongoDB and PostgreSQL) and uses Redis db 1
 
 cd ../frontend
 npm run typecheck && npm run lint && npm test
@@ -29,7 +29,7 @@ cd ../e2e && npm install
 npx playwright test                        # uses database `iotmonitor_e2e`, Redis db 2, ports 4100/5174, installed Chrome
 ```
 
-The tests never touch your data: the API tests use `iotmonitor_test` + Redis db 1, the E2E run recreates `iotmonitor_e2e` + Redis db 2 (the preparation script refuses any database name without "e2e").
+The tests never touch your data: the API tests use `iotmonitor_test` (in both databases) + Redis db 1, the E2E run recreates `iotmonitor_e2e` (in both) + Redis db 2. Both refuse any database name that does not end in `_test` / contain `e2e`.
 
 ### Live Ollama tests (optional, not in CI)
 

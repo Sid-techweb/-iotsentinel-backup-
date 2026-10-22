@@ -1,6 +1,7 @@
 import Redis from 'ioredis';
+import { MongoClient } from 'mongodb';
 import pg from 'pg';
-import { TEST_DATABASE_URL, TEST_REDIS_URL } from './env';
+import { TEST_DATABASE_URL, TEST_MONGO_URL, TEST_REDIS_URL } from './env';
 
 /** Creates a brand-new, empty test database and clears the test Redis index before every run. */
 export default async function setup() {
@@ -17,6 +18,14 @@ export default async function setup() {
   await admin.query(`DROP DATABASE IF EXISTS "${dbName}" WITH (FORCE)`);
   await admin.query(`CREATE DATABASE "${dbName}"`);
   await admin.end();
+
+  // MongoDB holds the operational data: start from an empty test database there too
+  const mongoName = new URL(TEST_MONGO_URL).pathname.slice(1);
+  if (!/^[a-z0-9_]+_test$/.test(mongoName)) throw new Error(`Refusing to run tests against MongoDB database "${mongoName}" - its name must end in _test`);
+  const mongo = new MongoClient(TEST_MONGO_URL);
+  await mongo.connect();
+  await mongo.db(mongoName).dropDatabase();
+  await mongo.close();
 
   const redis = new Redis(TEST_REDIS_URL);
   await redis.flushdb();

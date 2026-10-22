@@ -1,5 +1,5 @@
 import { config } from '../config';
-import { q } from '../db';
+import { col } from '../mongo';
 import { keys, redis } from '../redis';
 import { raiseAlert } from './alerts';
 import { publish } from './events';
@@ -10,13 +10,12 @@ import { publish } from './events';
  * offline and a critical alert is raised. Returns the number of devices that just went offline.
  */
 export async function sweepOnce(): Promise<number> {
-  const devices = await q<{ id: string; name: string; lastSeen: Date | null }>(
-    `SELECT id, name, last_seen FROM devices WHERE status <> 'offline' AND active`,
-  );
+  const devices = (await col('devices').find({ status: { $ne: 'offline' }, active: { $ne: false } }, { projection: { name: 1, lastSeen: 1 } }).toArray())
+    .map((d) => ({ id: d._id as unknown as string, name: d.name as string, lastSeen: (d.lastSeen ?? null) as Date | null }));
   let wentOffline = 0;
   for (const d of devices) {
     if (await redis.exists(keys.hb(d.id))) continue;
-    await q(`UPDATE devices SET status='offline' WHERE id=$1`, [d.id]);
+    await col('devices').updateOne({ _id: d.id as any }, { $set: { status: 'offline' } });
     const silent = d.lastSeen ? Math.round((Date.now() - new Date(d.lastSeen).getTime()) / 1000) : null;
     await raiseAlert({
       deviceId: d.id, type: 'heartbeat', severity: 'critical',
@@ -30,12 +29,9 @@ export async function sweepOnce(): Promise<number> {
 
 export function startSweeper() {
   const run = () => sweepOnce().catch((err) => console.error('[sweeper]', err));
-  // keep the telemetry table bounded
-  const purge = () => q(`DELETE FROM telemetry WHERE ts < now() - make_interval(days => $1::int)`, [config.retentionDays]).catch((e) => console.error('[retention]', e));
-  const purgeHistory = () => q(`DELETE FROM prediction_history WHERE created_at < now() - make_interval(days => $1::int)`, [config.predictionHistoryDays]).catch((e) => console.error('[retention]', e));
-  purge();
+  // telemetry is expired by a MongoDB TTL index (see mongo.ts); prediction history is pruned here
+  const purgeHistory = () => col('prediction_history').deleteMany({ createdAt: { $lt: new Date(Date.now() - config.predictionHistoryDays * 86_400_000) } }).catch((e) => console.error('[retention]', e));
   purgeHistory();
-  setInterval(purge, 3600_000).unref();
   setInterval(purgeHistory, 3600_000).unref();
   return setInterval(run, Math.max(1000, config.offlineAfterMs / 4));
 }

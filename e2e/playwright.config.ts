@@ -15,11 +15,14 @@ export const API_PORT = 4100;
 export const WEB_PORT = 5174;
 export const E2E_DB = process.env.E2E_DATABASE_URL ?? 'postgres://iot:iot@localhost:5433/iotmonitor_e2e';
 
+export const E2E_MONGO = process.env.E2E_MONGO_URL ?? 'mongodb://iot:iot@localhost:27017/iotmonitor_e2e?authSource=admin';
+
 const live = process.env.E2E_LIVE_LLM === '1';
 const apiEnv: Record<string, string> = {
   PORT: String(API_PORT),
   DATABASE_URL: E2E_DB,
   REDIS_URL: process.env.E2E_REDIS_URL ?? 'redis://localhost:6379/2',
+  MONGO_URL: E2E_MONGO,
   SIMULATOR: 'false',
   JWT_SECRET: 'e2e-secret-not-for-production',
   RATE_LIMIT: 'false',

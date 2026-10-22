@@ -1,6 +1,7 @@
 import request from 'supertest';
 import { createApp } from '../src/app';
-import { migrate, pool } from '../src/db';
+import { migrate } from '../src/db';
+import { col, ensureIndexes } from '../src/mongo';
 import { loadModel } from '../src/ml/model';
 import { setProviderForTests } from '../src/services/ai/provider';
 import { DeterministicTestProvider } from '../src/services/ai/testProvider';
@@ -14,6 +15,7 @@ export const uid = () => `${Date.now().toString(36)}${(counter++).toString(36)}$
 /** Schema + reference data (machine types, default rules, firmware releases) on the empty test database. */
 export async function bootstrap() {
   setProviderForTests(new DeterministicTestProvider()); // CI has no Ollama: use the labelled test double
+  await ensureIndexes();
   await migrate();
   await ensureReferenceData();
   loadModel();
@@ -29,7 +31,7 @@ export async function newUser(role: 'admin' | 'viewer' = 'admin') {
   const email = `${role}-${uid()}@test.local`;
   const res = await api().post('/api/auth/register').send({ name: `Test ${role}`, email, password: 'test-password-1' });
   if (res.status !== 201) throw new Error(`register failed: ${res.status} ${JSON.stringify(res.body)}`);
-  await pool.query('UPDATE users SET role=$2 WHERE id=$1', [res.body.user.id, role]);
+  await col('users').updateOne({ _id: res.body.user.id }, { $set: { role } });
   return { token: res.body.token as string, user: { ...res.body.user, role } as { id: string; email: string; name: string; role: string }, email };
 }
 

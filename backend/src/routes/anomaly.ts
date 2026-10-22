@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { q, q1 } from '../db';
+import { col } from '../mongo';
 import { ALERT_PROB, forgetModel, loadModel, modelFor } from '../ml/model';
 import { predictFromSeries } from '../ml/predictor';
 import { audit, ctxOf } from '../services/audit';
@@ -16,7 +16,8 @@ export const anomalyRouter = Router();
 
 /** Fleet-wide forecast, riskiest device first. Each device is judged with its machine type's limits and model. */
 anomalyRouter.get('/predictions', asyncH(async (_req, res) => {
-  const devices = await q<any>(`SELECT id, asset_no, name, type, location, status FROM devices WHERE status <> 'offline' AND active`);
+  const devices = (await col('devices').find({ status: { $ne: 'offline' }, active: { $ne: false } }, { projection: { assetNo: 1, name: 1, type: 1, location: 1, status: 1 } }).toArray())
+    .map((d) => ({ ...d, id: d._id as unknown as string }));
   const limitsByType = new Map<string, Awaited<ReturnType<typeof predictionLimits>>>();
   const out = [];
   for (const d of devices) {
@@ -34,8 +35,9 @@ anomalyRouter.get('/predictions', asyncH(async (_req, res) => {
 
 /** One device: recent history plus the model's forecast curve and explanation per metric. */
 anomalyRouter.get('/predictions/:deviceId', asyncH(async (req, res) => {
-  const dev = await q1('SELECT id, asset_no, name, type, location, status, active FROM devices WHERE id=$1', [req.params.deviceId]).catch(() => undefined);
-  if (!dev) throw new HttpError(404, 'Device not found');
+  const d = await col('devices').findOne({ _id: String(req.params.deviceId) as any }, { projection: { assetNo: 1, name: 1, type: 1, location: 1, status: 1, active: 1 } });
+  if (!d) throw new HttpError(404, 'Device not found');
+  const dev = { id: d._id as unknown as string, assetNo: d.assetNo, name: d.name, type: d.type, location: d.location, status: d.status, active: d.active !== false };
   const { points, prediction } = await predictDevice(dev.id, dev.type);
   res.json({ device: dev, points, prediction });
 }));
@@ -46,8 +48,9 @@ anomalyRouter.get('/predictions/:deviceId', asyncH(async (req, res) => {
  */
 anomalyRouter.get('/explain/:deviceId', asyncH(async (req, res) => {
   const { metric } = z.object({ metric: z.string().optional() }).parse(req.query);
-  const dev = await q1<any>('SELECT id, asset_no, name, type FROM devices WHERE id=$1', [req.params.deviceId]).catch(() => undefined);
-  if (!dev) throw new HttpError(404, 'Device not found');
+  const d = await col('devices').findOne({ _id: String(req.params.deviceId) as any }, { projection: { assetNo: 1, name: 1, type: 1 } });
+  if (!d) throw new HttpError(404, 'Device not found');
+  const dev = { id: d._id as unknown as string, assetNo: d.assetNo, name: d.name, type: d.type };
   const { points, prediction } = await predictDevice(dev.id, dev.type);
   const recent = points.slice(-10);
   res.json({
@@ -74,7 +77,7 @@ anomalyRouter.get('/history', asyncH(async (req, res) => {
 anomalyRouter.get('/models', asyncH(async (_req, res) => {
   const [types, stored] = await Promise.all([
     getDeviceTypes(),
-    q<any>('SELECT scope, source, samples, trained_at, model FROM models'),
+    col('models').find({}).toArray().then((rows) => rows.map((r) => ({ ...r, scope: r._id as unknown as string }))),
   ]);
   const g = loadModel();
   res.json([
@@ -132,8 +135,8 @@ anomalyRouter.post('/retrain', asyncH(async (req, res) => {
 anomalyRouter.delete('/models/:scope', asyncH(async (req, res) => {
   const scope = String(req.params.scope);
   if (scope === 'global') throw new HttpError(400, 'The global model cannot be removed');
-  await q('DELETE FROM models WHERE scope=$1', [scope]);
-  await q('UPDATE model_versions SET is_active=false WHERE scope=$1', [scope]);
+  await col('models').deleteOne({ _id: scope as any });
+  await col('model_versions').updateMany({ scope }, { $set: { isActive: false } });
   forgetModel(scope);
   publish('model', { scope });
   audit(ctxOf(req), 'model.reset_to_global', 'model', scope);

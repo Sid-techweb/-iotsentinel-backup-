@@ -1,5 +1,6 @@
 import { config } from '../config';
-import { pool, q, q1 } from '../db';
+import crypto from 'crypto';
+import { col, nextId } from '../mongo';
 import { METRIC_KEYS } from '../ml/metrics';
 import { keys, RECENT_MAX, redis } from '../redis';
 import { hashKey, newDeviceKey } from '../util';
@@ -71,29 +72,35 @@ const HISTORY_POINTS = 100;
 export async function ensureReferenceData(): Promise<string[]> {
   const added: string[] = [];
   for (const t of DEFAULT_TYPES) {
-    const row = await q1<{ name: string }>(
-      `INSERT INTO device_types (name, description, metrics, baselines) VALUES ($1,$2,$3,$4)
-       ON CONFLICT (name) DO NOTHING RETURNING name`,
-      [t.name, t.description, Object.keys(t.baselines), JSON.stringify(t.baselines)],
+    const r = await col('device_types').updateOne(
+      { name: t.name },
+      { $setOnInsert: { _id: (await nextId('device_types')) as any, name: t.name, description: t.description, metrics: Object.keys(t.baselines), baselines: t.baselines, createdAt: new Date() } },
+      { upsert: true },
     );
-    if (row) added.push(row.name);
+    if (r.upsertedCount) added.push(t.name);
   }
-  for (const [metric, op, threshold, severity] of RULES) {
-    await q('INSERT INTO rules (metric, operator, threshold, severity) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING', [metric, op, threshold, severity]);
-  }
+  const addRule = async (metric: string, operator: string, threshold: number, severity: string, deviceType: string | null) => {
+    await col('rules').updateOne(
+      { metric, severity, deviceType },
+      { $setOnInsert: { _id: (await nextId('rules')) as any, metric, operator, threshold, severity, enabled: true, deviceType } },
+      { upsert: true },
+    );
+  };
+  for (const [metric, op, threshold, severity] of RULES) await addRule(metric, op, threshold, severity, null);
   // overrides are only created together with their machine type, so deleting one later sticks
   for (const [type, metric, op, threshold, severity] of OVERRIDES) {
     if (!added.includes(type)) continue;
-    await q('INSERT INTO rules (metric, operator, threshold, severity, device_type) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING', [metric, op, threshold, severity, type]);
+    await addRule(metric, op, threshold, severity, type);
   }
   let month = 4;
   for (const [type, list] of Object.entries(RELEASES)) {
     let i = 0;
     for (const [version, notes, sec] of list) {
-      await q(
-        `INSERT INTO firmware_releases (device_type, version, notes, security_patch, released_at)
-         VALUES ($1,$2,$3,$4, now() - ($5 || ' days')::interval) ON CONFLICT (device_type, version) DO NOTHING`,
-        [type, version, notes, sec, String((list.length - i) * 35 + month)],
+      const releasedAt = new Date(Date.now() - ((list.length - i) * 35 + month) * 86_400_000);
+      await col('firmware_releases').updateOne(
+        { deviceType: type, version },
+        { $setOnInsert: { _id: (await nextId('firmware_releases')) as any, deviceType: type, version, notes, securityPatch: sec, releasedAt } },
+        { upsert: true },
       );
       i++;
     }
@@ -108,17 +115,15 @@ export async function ensureReferenceData(): Promise<string[]> {
 async function backfill(deviceId: string, type: string) {
   const st = newState(deviceId, type, await baselinesFor(type));
   const now = Date.now();
-  const rows: unknown[][] = [];
+  const rows: Record<string, unknown>[] = [];
   const recent: string[] = [];
   for (let n = HISTORY_POINTS; n >= 1; n--) {
     const ts = new Date(now - n * config.simIntervalMs);
     const m = reading(st);
-    rows.push([deviceId, ts, ...METRIC_KEYS.map((k) => m[k])]);
+    rows.push({ deviceId, ts, ...Object.fromEntries(METRIC_KEYS.map((k) => [k, m[k]])) });
     recent.push(JSON.stringify({ ts: ts.getTime(), ...m }));
   }
-  const width = 2 + METRIC_KEYS.length;
-  const values = rows.map((_, r) => `(${Array.from({ length: width }, (_, c) => `$${r * width + c + 1}`).join(',')})`).join(',');
-  await pool.query(`INSERT INTO telemetry (device_id, ts, ${METRIC_KEYS.join(', ')}) VALUES ${values}`, rows.flat() as any[]);
+  await col('telemetry').insertMany(rows as any[]);
   await redis.del(keys.recent(deviceId));
   await redis.lpush(keys.recent(deviceId), ...recent.slice(-RECENT_MAX)); // oldest first in => newest ends up at head
   await redis.set(keys.latest(deviceId), recent[recent.length - 1]);
@@ -127,18 +132,22 @@ async function backfill(deviceId: string, type: string) {
 async function addDevices(list: typeof DEVICES) {
   const created: { id: string; type: string }[] = [];
   for (const [i, [name, type, location, fw]] of list.entries()) {
-    const row = await q1<{ id: string }>(
-      `INSERT INTO devices (name, type, location, ip_address, firmware_version, api_key_hash, simulated)
-       VALUES ($1,$2,$3,$4,$5,$6,TRUE) ON CONFLICT (name) DO NOTHING RETURNING id`,
-      [name, type, location, `10.20.${Math.floor(i / 4)}.${10 + i}`, fw, hashKey(newDeviceKey())],
+    const id = crypto.randomUUID();
+    const r = await col('devices').updateOne(
+      { name },
+      { $setOnInsert: {
+        _id: id as any, assetNo: await nextId('assetNo'), name, type, location, ipAddress: `10.20.${Math.floor(i / 4)}.${10 + i}`, firmwareVersion: fw,
+        status: 'offline', active: true, simulated: true, apiKeyHash: hashKey(newDeviceKey()), lastSeen: null, createdAt: new Date(),
+      } },
+      { upsert: true },
     );
-    if (row) { created.push({ id: row.id, type }); await backfill(row.id, type); }
+    if (r.upsertedCount) { created.push({ id, type }); await backfill(id, type); }
   }
   return created;
 }
 
 export async function seedIfEmpty(newTypes: string[] = []) {
-  const { count } = (await q1<{ count: number }>('SELECT count(*)::int AS count FROM devices'))!;
+  const count = await col('devices').estimatedDocumentCount();
   if (count > 0) {
     // an existing installation gains demo machines for any machine type introduced by this upgrade
     const extra = DEVICES.filter(([, type]) => newTypes.includes(type));
@@ -151,7 +160,7 @@ export async function seedIfEmpty(newTypes: string[] = []) {
   console.log('[seed] empty database - seeding demo fleet');
   const ids = await addDevices(DEVICES);
 
-  const hoursAgo = (h: number) => `now() - interval '${h} hours'`;
+  const hoursAgo = (h: number) => new Date(Date.now() - h * 3_600_000);
   const incidents: [number, string, string, string, string, number][] = [
     [0, 'Brute-force login', 'high', '63 failed admin logins in 60s from 203.0.113.44', 'resolved', 52],
     [7, 'Unsigned firmware attempt', 'critical', 'Firmware image rejected: signature verification failed', 'investigating', 20],
@@ -162,11 +171,10 @@ export async function seedIfEmpty(newTypes: string[] = []) {
     [3, 'Unauthorized access', 'high', 'Successful login from an IP outside the allow-list', 'open', 5],
   ];
   for (const [di, category, severity, description, status, h] of incidents) {
-    await q(
-      `INSERT INTO security_incidents (device_id, category, severity, description, status, created_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5, ${hoursAgo(h)}, ${hoursAgo(Math.max(0, h - 2))})`,
-      [ids[di].id, category, severity, description, status],
-    );
+    await col('security_incidents').insertOne({
+      _id: (await nextId('security_incidents')) as any, deviceId: ids[di].id, category, severity, description, status,
+      createdAt: hoursAgo(h), updatedAt: hoursAgo(Math.max(0, h - 2)),
+    });
   }
   console.log(`[seed] ${ids.length} devices, ${HISTORY_POINTS} readings each`);
 }

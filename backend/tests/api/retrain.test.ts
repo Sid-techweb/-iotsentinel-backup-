@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { pool } from '../../src/db';
+import { col } from '../../src/mongo';
 import { loadModel, modelFor } from '../../src/ml/model';
 import { storeOverheatingHistory } from '../fixtures';
 import { api, bearer, bootstrap, newDevice, newUser, uid } from '../helpers';
@@ -25,7 +25,7 @@ describe('retraining a machine type from its own telemetry', () => {
     expect(modelFor(name).scope).toBe(name);
     expect(modelFor(name).source).toBe('telemetry');
     expect(modelFor('Gateway')).toBe(loadModel()); // other types are untouched
-    expect((await pool.query('SELECT source, samples FROM models WHERE scope=$1', [name])).rows[0].source).toBe('telemetry');
+    expect((await col('models').findOne({ _id: name }))!.source).toBe('telemetry');
 
     const card = (await api().get(`/api/anomaly/model?scope=${encodeURIComponent(name)}`).set(bearer(admin.token))).body;
     expect(card).toMatchObject({ scope: name, source: 'telemetry', fallback: false });

@@ -2,7 +2,7 @@ import bcrypt from 'bcryptjs';
 import { RequestHandler } from 'express';
 import jwt from 'jsonwebtoken';
 import { config } from './config';
-import { q1 } from './db';
+import { col } from './mongo';
 import { HttpError } from './util';
 
 export type Role = 'admin' | 'viewer';
@@ -29,9 +29,9 @@ export const authenticate: RequestHandler = async (req, _res, next) => {
     } catch {
       throw new HttpError(401, 'Session expired - sign in again');
     }
-    const user = await q1<AuthUser>('SELECT id, email, name, role FROM users WHERE id=$1', [sub]);
-    if (!user) throw new HttpError(401, 'Account no longer exists');
-    req.user = user;
+    const row = await col('users').findOne({ _id: sub as any });
+    if (!row) throw new HttpError(401, 'Account no longer exists');
+    req.user = { id: row._id as unknown as string, email: row.email, name: row.name, role: row.role };
     next();
   } catch (e) {
     next(e);

@@ -1,4 +1,4 @@
-import { q, q1 } from '../db';
+import { col, nextId } from '../mongo';
 import { publish } from './events';
 import { notify } from './webhooks';
 
@@ -14,35 +14,29 @@ export interface RaiseInput {
 /** Open an alert, or refresh the existing unresolved one for the same device/type/metric. */
 export async function raiseAlert(a: RaiseInput) {
   const metric = a.metric ?? null;
-  const existing = await q1<{ id: number; severity: string }>(
-    `SELECT id, severity FROM alerts WHERE device_id=$1 AND type=$2 AND metric IS NOT DISTINCT FROM $3 AND status<>'resolved' LIMIT 1`,
-    [a.deviceId, a.type, metric],
-  );
+  const existing = await col('alerts').findOne({ deviceId: a.deviceId, type: a.type, metric, status: { $ne: 'resolved' } });
   if (existing) {
-    await q('UPDATE alerts SET severity=$2, message=$3, value=$4 WHERE id=$1', [existing.id, a.severity, a.message, a.value ?? null]);
-    if (existing.severity !== a.severity) publish('alert', { id: existing.id });
+    await col('alerts').updateOne({ _id: existing._id }, { $set: { severity: a.severity, message: a.message, value: a.value ?? null } });
+    if (existing.severity !== a.severity) publish('alert', { id: existing._id });
     return;
   }
-  const created = await q1<{ id: number }>(
-    `INSERT INTO alerts (device_id, type, severity, metric, message, value) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-    [a.deviceId, a.type, a.severity, metric, a.message, a.value ?? null],
-  );
-  publish('alert', { id: created?.id });
+  const id = await nextId('alerts');
+  await col('alerts').insertOne({
+    _id: id as any, deviceId: a.deviceId, type: a.type, severity: a.severity, metric, message: a.message, value: a.value ?? null,
+    status: 'open', createdAt: new Date(), resolvedAt: null,
+  });
+  publish('alert', { id });
 
   // page people only for what needs attention: critical alerts and model predictions
   const event = a.type === 'predictive' ? 'alert.predictive' : a.severity === 'critical' ? 'alert.critical' : null;
   if (event) {
-    const dev = await q1<{ name: string; type: string }>('SELECT name, type FROM devices WHERE id=$1', [a.deviceId]);
-    notify(event, { alertId: created?.id, device: dev?.name, deviceType: dev?.type, severity: a.severity, metric, value: a.value ?? null, message: a.message },
+    const dev = await col('devices').findOne({ _id: a.deviceId as any }, { projection: { name: 1, type: 1 } });
+    notify(event, { alertId: id, device: dev?.name, deviceType: dev?.type, severity: a.severity, metric, value: a.value ?? null, message: a.message },
       `[${a.severity.toUpperCase()}] ${dev?.name ?? 'device'}: ${a.message}`);
   }
 }
 
 export async function clearAlerts(deviceId: string, type: RaiseInput['type'], metric: string | null = null) {
-  const rows = await q(
-    `UPDATE alerts SET status='resolved', resolved_at=now()
-     WHERE device_id=$1 AND type=$2 AND metric IS NOT DISTINCT FROM $3 AND status<>'resolved' RETURNING id`,
-    [deviceId, type, metric],
-  );
-  if (rows.length) publish('alert', { cleared: rows.length });
+  const r = await col('alerts').updateMany({ deviceId, type, metric, status: { $ne: 'resolved' } }, { $set: { status: 'resolved', resolvedAt: new Date() } });
+  if (r.modifiedCount) publish('alert', { cleared: r.modifiedCount });
 }

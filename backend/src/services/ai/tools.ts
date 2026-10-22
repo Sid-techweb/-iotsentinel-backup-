@@ -1,5 +1,6 @@
 import { config } from '../../config';
-import { q, q1 } from '../../db';
+import { col } from '../../mongo';
+import { deviceBriefs, latestFirmwareByType, withDevice } from '../deviceQueries';
 import { METRIC_KEYS, METRICS, MetricKey } from '../../ml/metrics';
 import { keys, redis } from '../../redis';
 import { predictDevice } from '../prediction';
@@ -43,41 +44,55 @@ export async function withTimeout<T>(p: Promise<T>, ms = TOOL_TIMEOUT_MS): Promi
 
 /* ------------------------------------------------------------------ device lookup */
 
+const REF_FIELDS = { name: 1, assetNo: 1, type: 1, simulated: 1, active: 1 };
+const toRef = (d: any): DeviceRef => ({ id: d._id as string, name: d.name, assetNo: d.assetNo, type: d.type, simulated: !!d.simulated, active: d.active !== false });
+
 export async function allDevices(): Promise<DeviceRef[]> {
-  return q<DeviceRef>('SELECT id, name, asset_no, type, simulated, active FROM devices ORDER BY asset_no');
+  return (await col('devices').find({}, { projection: REF_FIELDS }).sort({ assetNo: 1 }).toArray()).map(toRef);
 }
 
 export async function deviceById(id: string): Promise<DeviceRef | undefined> {
-  return q1<DeviceRef>('SELECT id, name, asset_no, type, simulated, active FROM devices WHERE id=$1', [id]).catch(() => undefined);
+  const d = await col('devices').findOne({ _id: id as any }, { projection: REF_FIELDS });
+  return d ? toRef(d) : undefined;
 }
+
+/** Devices in service that are not offline - the ones that have live readings to rank. */
+const liveDevices = async () => (await col('devices').find({ active: { $ne: false }, status: { $ne: 'offline' } }, { projection: REF_FIELDS }).sort({ assetNo: 1 }).toArray()).map(toRef);
 
 /* ------------------------------------------------------------------ fleet-level tools */
 
 export async function fleetStatus(): Promise<ToolResult> {
-  const [counts, inactive, unhealthy, sim] = await Promise.all([
-    q<{ status: string; n: number }>('SELECT status, count(*)::int AS n FROM devices WHERE active GROUP BY status'),
-    q1<{ n: number }>('SELECT count(*)::int AS n FROM devices WHERE NOT active'),
-    q<any>(`SELECT d.asset_no, d.name, d.type, d.status, (SELECT count(*)::int FROM alerts a WHERE a.device_id=d.id AND a.status<>'resolved') AS open_alerts,
-                   d.last_seen
-              FROM devices d WHERE d.active AND d.status <> 'online' ORDER BY d.status DESC, d.asset_no LIMIT ${rows()}`),
-    q1<{ n: number; total: number }>('SELECT count(*) FILTER (WHERE simulated)::int AS n, count(*)::int AS total FROM devices'),
+  const devices = col('devices');
+  const [counts, inactiveN, unhealthyDocs, simN, total] = await Promise.all([
+    devices.aggregate([{ $match: { active: { $ne: false } } }, { $group: { _id: '$status', n: { $sum: 1 } } }]).toArray(),
+    devices.countDocuments({ active: false }),
+    devices.find({ active: { $ne: false }, status: { $ne: 'online' } }, { projection: { assetNo: 1, name: 1, type: 1, status: 1, lastSeen: 1 } }).toArray(),
+    devices.countDocuments({ simulated: true }),
+    devices.countDocuments({}),
   ]);
-  const c = (s: string) => counts.find((x) => x.status === s)?.n ?? 0;
-  const total = c('online') + c('degraded') + c('offline');
+  unhealthyDocs.sort((a, b) => (a.status < b.status ? 1 : a.status > b.status ? -1 : a.assetNo - b.assetNo));
+  const shown = unhealthyDocs.slice(0, rows());
+  const open = shown.length
+    ? await col('alerts').aggregate([{ $match: { deviceId: { $in: shown.map((d) => d._id) }, status: { $ne: 'resolved' } } }, { $group: { _id: '$deviceId', n: { $sum: 1 } } }]).toArray()
+    : [];
+  const openBy = new Map(open.map((o) => [o._id as string, o.n as number]));
+  const unhealthy = shown.map((d) => ({ assetNo: d.assetNo, name: d.name, type: d.type, status: d.status, openAlerts: openBy.get(d._id as string) ?? 0, lastSeen: d.lastSeen }));
+  const c = (s: string) => counts.find((x) => x._id === s)?.n ?? 0;
+  const inService = c('online') + c('degraded') + c('offline');
   const lines = [
-    `Devices in service: ${total} (online ${c('online')}, degraded ${c('degraded')}, offline ${c('offline')}). Deactivated: ${inactive?.n ?? 0}.`,
+    `Devices in service: ${inService} (online ${c('online')}, degraded ${c('degraded')}, offline ${c('offline')}). Deactivated: ${inactiveN}.`,
     unhealthy.length
-      ? `Unhealthy devices (degraded or offline): ${unhealthy.map((d: any) => `${label({ assetNo: d.assetNo, name: d.name })} (${d.type}, ${d.status}, ${d.openAlerts} open alert${d.openAlerts === 1 ? '' : 's'})`).join('; ')}.`
+      ? `Unhealthy devices (degraded or offline): ${unhealthy.map((d) => `${label({ assetNo: d.assetNo, name: d.name })} (${d.type}, ${d.status}, ${d.openAlerts} open alert${d.openAlerts === 1 ? '' : 's'})`).join('; ')}.`
       : 'No device is currently degraded or offline.',
-    `${sim?.n ?? 0} of ${sim?.total ?? 0} registered devices are simulated.`,
+    `${simN} of ${total} registered devices are simulated.`,
   ];
-  return { tool: 'fleet_status', title: 'Fleet status', facts: lines.join('\n'), asOf: iso(), simulated: (sim?.n ?? 0) > 0,
-    data: { online: c('online'), degraded: c('degraded'), offline: c('offline'), inactive: inactive?.n ?? 0, unhealthy } };
+  return { tool: 'fleet_status', title: 'Fleet status', facts: lines.join('\n'), asOf: iso(), simulated: simN > 0,
+    data: { online: c('online'), degraded: c('degraded'), offline: c('offline'), inactive: inactiveN, unhealthy } };
 }
 
 export async function topRisk(n = 5): Promise<ToolResult> {
   const limit = Math.min(Math.max(n, 1), rows());
-  const devices = await q<any>(`SELECT id, asset_no, name, type, simulated FROM devices WHERE active AND status <> 'offline'`);
+  const devices = await liveDevices();
   const ranked: any[] = [];
   for (const d of devices) {
     const { prediction } = await predictDevice(d.id, d.type);
@@ -95,10 +110,10 @@ export async function topRisk(n = 5): Promise<ToolResult> {
 }
 
 export async function highestMetric(metric: MetricKey): Promise<ToolResult> {
-  const devices = await q<any>(`SELECT id, asset_no, name, type, simulated FROM devices WHERE active AND status <> 'offline'`);
-  const latest = devices.length ? await redis.mget(devices.map((d: any) => keys.latest(d.id))) : [];
+  const devices = await liveDevices();
+  const latest = devices.length ? await redis.mget(devices.map((d) => keys.latest(d.id))) : [];
   const found: any[] = [];
-  devices.forEach((d: any, i: number) => {
+  devices.forEach((d, i) => {
     const p = latest[i] ? JSON.parse(latest[i]!) : null;
     const v = p?.[metric];
     if (typeof v === 'number') found.push({ device: d, value: v, at: p.ts });
@@ -115,48 +130,67 @@ export async function highestMetric(metric: MetricKey): Promise<ToolResult> {
 }
 
 export async function alertsSummary(period: 'today' | '24h' | '7d' = 'today'): Promise<ToolResult> {
-  const since = period === 'today' ? "date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'" : period === '24h' ? "now() - interval '24 hours'" : "now() - interval '7 days'";
-  const [bySev, recent, total] = await Promise.all([
-    q<any>(`SELECT severity, type, count(*)::int AS n FROM alerts WHERE created_at >= ${since} GROUP BY severity, type ORDER BY n DESC`),
-    q<any>(`SELECT a.severity, a.type, a.metric, a.message, a.status, a.created_at, d.name AS device_name, d.asset_no
-              FROM alerts a JOIN devices d ON d.id=a.device_id WHERE a.created_at >= ${since} ORDER BY a.created_at DESC LIMIT ${rows()}`),
-    q1<{ n: number; active: number }>(`SELECT count(*)::int AS n, count(*) FILTER (WHERE status <> 'resolved')::int AS active FROM alerts WHERE created_at >= ${since}`),
+  const now = new Date();
+  const since = period === 'today' ? new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())) : new Date(now.getTime() - (period === '24h' ? 24 : 168) * 3_600_000);
+  const alerts = col('alerts');
+  const [bySevRows, recentRows, totalN, activeN] = await Promise.all([
+    alerts.aggregate([{ $match: { createdAt: { $gte: since } } }, { $group: { _id: { severity: '$severity', type: '$type' }, n: { $sum: 1 } } }, { $sort: { n: -1 } }]).toArray(),
+    alerts.find({ createdAt: { $gte: since } }).sort({ createdAt: -1 }).limit(rows()).toArray(),
+    alerts.countDocuments({ createdAt: { $gte: since } }),
+    alerts.countDocuments({ createdAt: { $gte: since }, status: { $ne: 'resolved' } }),
   ]);
+  const bySev = bySevRows.map((r) => ({ severity: r._id.severity, type: r._id.type, n: r.n }));
+  const recent = await withDevice(recentRows.map((r) => ({ ...r, id: r._id, deviceId: r.deviceId })));
   const periodLabel = period === 'today' ? 'today (since 00:00 UTC)' : period === '24h' ? 'the last 24 hours' : 'the last 7 days';
   const lines = [
-    `Alerts raised ${periodLabel}: ${total?.n ?? 0} (${total?.active ?? 0} still unresolved).`,
-    bySev.length ? `By severity and type: ${bySev.map((r: any) => `${r.n} ${r.severity} ${r.type}`).join(', ')}.` : 'No alerts in that period.',
-    ...recent.slice(0, 10).map((a: any) => `- ${new Date(a.createdAt).toISOString().slice(11, 19)}Z ${label({ assetNo: a.assetNo, name: a.deviceName })}: ${a.severity} ${a.type}${a.metric ? ` (${a.metric})` : ''} - ${a.message} [${a.status}]`),
+    `Alerts raised ${periodLabel}: ${totalN} (${activeN} still unresolved).`,
+    bySev.length ? `By severity and type: ${bySev.map((r) => `${r.n} ${r.severity} ${r.type}`).join(', ')}.` : 'No alerts in that period.',
+    ...recent.slice(0, 10).map((a: any) => `- ${new Date(a.createdAt).toISOString().slice(11, 19)}Z ${label({ assetNo: a.assetNo ?? 0, name: a.deviceName ?? 'unknown' })}: ${a.severity} ${a.type}${a.metric ? ` (${a.metric})` : ''} - ${a.message} [${a.status}]`),
   ];
-  return { tool: 'alerts_summary', title: `Alerts ${periodLabel}`, facts: lines.join('\n'), asOf: iso(), simulated: true, data: { period, total: total?.n ?? 0, bySev, recent } };
+  return { tool: 'alerts_summary', title: `Alerts ${periodLabel}`, facts: lines.join('\n'), asOf: iso(), simulated: true, data: { period, total: totalN, bySev, recent } };
 }
 
 export async function breachesByType(days = 7): Promise<ToolResult> {
   const d = Math.min(Math.max(days, 1), 90);
-  const data = await q<any>(
-    `SELECT dev.type, count(*)::int AS breaches, count(DISTINCT dev.id)::int AS devices
-       FROM alerts a JOIN devices dev ON dev.id=a.device_id
-      WHERE a.type='threshold' AND a.created_at >= now() - make_interval(days => $1::int)
-      GROUP BY dev.type ORDER BY breaches DESC LIMIT ${rows()}`, [d]);
+  const per = await col('alerts').aggregate([
+    { $match: { type: 'threshold', createdAt: { $gte: new Date(Date.now() - d * 86_400_000) } } },
+    { $group: { _id: '$deviceId', n: { $sum: 1 } } },
+  ]).toArray();
+  const briefs = await deviceBriefs(per.map((p) => p._id as string));
+  const byType = new Map<string, { breaches: number; devices: number }>();
+  for (const p of per) {
+    const type = briefs.get(p._id as string)?.type;
+    if (!type) continue;
+    const e = byType.get(type) ?? { breaches: 0, devices: 0 };
+    e.breaches += p.n; e.devices += 1;
+    byType.set(type, e);
+  }
+  const data = [...byType].map(([type, v]) => ({ type, ...v })).sort((a, b) => b.breaches - a.breaches).slice(0, rows());
   const lines = data.length
-    ? data.map((r: any, i: number) => `${i + 1}. ${r.type}: ${r.breaches} threshold breach${r.breaches === 1 ? '' : 'es'} across ${r.devices} device${r.devices === 1 ? '' : 's'}`)
+    ? data.map((r, i) => `${i + 1}. ${r.type}: ${r.breaches} threshold breach${r.breaches === 1 ? '' : 'es'} across ${r.devices} device${r.devices === 1 ? '' : 's'}`)
     : ['No threshold breaches in that period.'];
   return { tool: 'breaches_by_type', title: `Threshold breaches by machine type (last ${d} days)`, facts: lines.join('\n'), asOf: iso(), simulated: true, data };
 }
 
 export async function maintenanceAttention(n = 5): Promise<ToolResult> {
   const limit = Math.min(Math.max(n, 1), rows());
-  const devices = await q<any>(`
-    SELECT d.id, d.asset_no, d.name, d.type, d.status, d.simulated, d.firmware_version,
-           (SELECT count(*)::int FROM alerts a WHERE a.device_id=d.id AND a.status<>'resolved' AND a.severity='critical') AS critical_alerts,
-           (SELECT count(*)::int FROM alerts a WHERE a.device_id=d.id AND a.status<>'resolved') AS open_alerts,
-           (SELECT count(*)::int FROM alerts a WHERE a.device_id=d.id AND a.type='threshold' AND a.created_at >= now() - interval '7 days') AS breaches_7d,
-           (SELECT count(*)::int FROM firmware_releases r WHERE r.device_type=d.type AND r.security_patch) AS patch_releases,
-           (SELECT max(performed_at) FROM maintenance_records m WHERE m.device_id=d.id AND m.kind IN ('inspection','repair','replacement','calibration')) AS last_service
-      FROM devices d WHERE d.active`);
-  const security = await q<any>('SELECT device_type, version FROM firmware_releases WHERE security_patch');
+  const devices = await col('devices').find({ active: { $ne: false } }, { projection: { assetNo: 1, name: 1, type: 1, status: 1, simulated: 1, firmwareVersion: 1 } }).toArray();
+  const ids = devices.map((d) => d._id as string);
+  const week = new Date(Date.now() - 7 * 86_400_000);
+  const [openRows, breachRows, serviceRows, security] = await Promise.all([
+    col('alerts').aggregate([{ $match: { deviceId: { $in: ids }, status: { $ne: 'resolved' } } }, { $group: { _id: '$deviceId', open: { $sum: 1 }, critical: { $sum: { $cond: [{ $eq: ['$severity', 'critical'] }, 1, 0] } } } }]).toArray(),
+    col('alerts').aggregate([{ $match: { deviceId: { $in: ids }, type: 'threshold', createdAt: { $gte: week } } }, { $group: { _id: '$deviceId', n: { $sum: 1 } } }]).toArray(),
+    col('maintenance_records').aggregate([{ $match: { deviceId: { $in: ids }, kind: { $in: ['inspection', 'repair', 'replacement', 'calibration'] } } }, { $group: { _id: '$deviceId', last: { $max: '$performedAt' } } }]).toArray(),
+    col('firmware_releases').find({ securityPatch: true }).toArray(),
+  ]);
+  const open = new Map(openRows.map((r) => [r._id as string, r]));
+  const breaches = new Map(breachRows.map((r) => [r._id as string, r.n as number]));
+  const service = new Map(serviceRows.map((r) => [r._id as string, r.last as Date]));
   const scored: any[] = [];
-  for (const d of devices) {
+  for (const dev of devices) {
+    const id = dev._id as string;
+    const d = { id, assetNo: dev.assetNo, name: dev.name, type: dev.type, status: dev.status, simulated: !!dev.simulated, firmwareVersion: dev.firmwareVersion,
+      criticalAlerts: open.get(id)?.critical ?? 0, openAlerts: open.get(id)?.open ?? 0, breaches7d: breaches.get(id) ?? 0, lastService: service.get(id) ?? null };
     const { prediction } = d.status === 'offline' ? { prediction: null } : await predictDevice(d.id, d.type);
     const reasons: string[] = [];
     let score = 0;
@@ -180,7 +214,7 @@ export async function maintenanceAttention(n = 5): Promise<ToolResult> {
 }
 
 export async function modelInfo(): Promise<ToolResult> {
-  const versions = await q<any>(`SELECT scope, version, source, evaluation, samples, activated, is_active, reason, trained_at FROM model_versions WHERE is_active ORDER BY scope`);
+  const versions = (await col('model_versions').find({ isActive: true }, { projection: { model: 0 } }).sort({ scope: 1 }).toArray()).map((v) => ({ ...v, id: v._id }));
   const lines = versions.map((v: any) => `${v.scope}: v${v.version} (${v.source}), AUC ${n1(v.evaluation?.auc, 2)}, precision ${n1((v.evaluation?.precision ?? 0) * 100, 0)}%, recall ${n1((v.evaluation?.recall ?? 0) * 100, 0)}%, trained on ${v.samples} samples${v.source === 'synthetic' ? ' - synthetic data, which does not demonstrate real-world accuracy' : ''}`);
   return { tool: 'model_info', title: 'Prediction models in use', facts: ['Active prediction models (they predict threshold breaches, not equipment failures):', ...lines].join('\n'), asOf: iso(), simulated: true, data: versions };
 }
@@ -188,17 +222,19 @@ export async function modelInfo(): Promise<ToolResult> {
 /* ------------------------------------------------------------------ device-level tools */
 
 export async function deviceProfile(d: DeviceRef): Promise<ToolResult> {
-  const [row, alerts, maint] = await Promise.all([
-    q1<any>(`SELECT d.*, (SELECT r.version FROM firmware_releases r WHERE r.device_type=d.type ORDER BY r.released_at DESC, r.id DESC LIMIT 1) AS latest_firmware FROM devices d WHERE d.id=$1`, [d.id]),
-    q<any>(`SELECT severity, type, metric, message, status, created_at FROM alerts WHERE device_id=$1 AND status<>'resolved' ORDER BY created_at DESC LIMIT ${rows()}`, [d.id]),
-    q<any>('SELECT kind, summary, performed_at FROM maintenance_records WHERE device_id=$1 ORDER BY performed_at DESC LIMIT 5', [d.id]),
+  const [doc, latestFw, alerts, maint] = await Promise.all([
+    col('devices').findOne({ _id: d.id as any }, { projection: { apiKeyHash: 0, apiKey: 0 } }),
+    latestFirmwareByType(),
+    col('alerts').find({ deviceId: d.id, status: { $ne: 'resolved' } }).sort({ createdAt: -1 }).limit(rows()).toArray(),
+    col('maintenance_records').find({ deviceId: d.id }, { projection: { kind: 1, summary: 1, performedAt: 1 } }).sort({ performedAt: -1 }).limit(5).toArray(),
   ]);
+  const row = { ...doc, id: d.id, latestFirmware: latestFw.get(doc?.type) ?? null };
   const latestRaw = await redis.get(keys.latest(d.id));
   const latest = latestRaw ? JSON.parse(latestRaw) : null;
   const readings = latest ? METRIC_KEYS.filter((k) => typeof latest[k] === 'number').map((k) => `${METRICS[k].label} ${n1(latest[k])}${unitOf(k)}`).join(', ') : 'none';
   const lines = [
-    `${label(d)}: ${row.type} at ${row.location}; status ${row.active ? row.status : 'deactivated'}; last seen ${row.last_seen ? new Date(row.last_seen).toISOString() : 'never'}${d.simulated ? '; simulated device' : ''}.`,
-    `Firmware ${row.firmware_version} (latest release ${row.latest_firmware ?? 'unknown'}${row.latest_firmware && compareVersions(row.firmware_version, row.latest_firmware) < 0 ? ', update available' : ''}).`,
+    `${label(d)}: ${row.type} at ${row.location}; status ${row.active !== false ? row.status : 'deactivated'}; last seen ${row.lastSeen ? new Date(row.lastSeen).toISOString() : 'never'}${d.simulated ? '; simulated device' : ''}.`,
+    `Firmware ${row.firmwareVersion} (latest release ${row.latestFirmware ?? 'unknown'}${row.latestFirmware && compareVersions(row.firmwareVersion, row.latestFirmware) < 0 ? ', update available' : ''}).`,
     `Latest readings: ${readings}.`,
     alerts.length ? `Open alerts: ${alerts.map((a: any) => `${a.severity} ${a.type}${a.metric ? ` (${a.metric})` : ''}: ${a.message}`).join(' | ')}` : 'No open alerts.',
     maint.length ? `Recent maintenance: ${maint.map((m: any) => `${new Date(m.performedAt).toISOString().slice(0, 10)} ${m.kind} - ${m.summary}`).join(' | ')}` : 'No maintenance recorded.',
@@ -207,7 +243,7 @@ export async function deviceProfile(d: DeviceRef): Promise<ToolResult> {
 }
 
 export async function maintenanceHistory(d: DeviceRef): Promise<ToolResult> {
-  const data = await q<any>(`SELECT kind, summary, details, performed_by_name, performed_at FROM maintenance_records WHERE device_id=$1 ORDER BY performed_at DESC LIMIT ${rows()}`, [d.id]);
+  const data = await col('maintenance_records').find({ deviceId: d.id }, { projection: { kind: 1, summary: 1, details: 1, performedByName: 1, performedAt: 1 } }).sort({ performedAt: -1 }).limit(rows()).toArray();
   const lines = data.length
     ? data.map((m: any) => `- ${new Date(m.performedAt).toISOString().slice(0, 10)} ${m.kind}: ${m.summary}${m.details ? ` (${m.details})` : ''} - ${m.performedByName}`)
     : ['No maintenance has been recorded for this device.'];
@@ -217,22 +253,28 @@ export async function maintenanceHistory(d: DeviceRef): Promise<ToolResult> {
 export async function telemetryHistory(d: DeviceRef, metric: MetricKey | null, minutes = 60): Promise<ToolResult> {
   const mins = Math.min(Math.max(minutes, 5), 1440);
   const metricList = metric ? [metric] : METRIC_KEYS.slice();
+  const since = new Date(Date.now() - mins * 60_000);
   const stats: any[] = [];
   const lines: string[] = [];
   for (const m of metricList) {
-    // the column name comes from the METRIC_KEYS whitelist, never from user text
-    const s = await q1<any>(
-      `SELECT count(${m})::int AS n, min(${m}) AS lo, avg(${m}) AS mean, max(${m}) AS hi FROM telemetry WHERE device_id=$1 AND ts >= now() - make_interval(mins => $2::int)`, [d.id, mins]);
+    // the field name comes from the METRIC_KEYS whitelist, never from user text
+    const [s] = await col('telemetry').aggregate([
+      { $match: { deviceId: d.id, ts: { $gte: since }, [m]: { $ne: null } } },
+      { $group: { _id: null, n: { $sum: 1 }, lo: { $min: `$${m}` }, mean: { $avg: `$${m}` }, hi: { $max: `$${m}` } } },
+    ]).toArray();
     if (!s || !s.n) continue;
-    const last = await q1<any>(`SELECT ${m} AS v, ts FROM telemetry WHERE device_id=$1 AND ${m} IS NOT NULL ORDER BY ts DESC LIMIT 1`, [d.id]);
+    const last = await col('telemetry').find({ deviceId: d.id, [m]: { $ne: null } }, { projection: { _id: 0, v: `$${m}`, ts: 1, [m]: 1 } }).sort({ ts: -1 }).limit(1).next();
+    const bucketMs = Math.max(30, (mins * 60) / 12) * 1000;
     const sample = metric
-      ? await q<any>(
-        `SELECT to_timestamp(floor(extract(epoch FROM ts) / $3::float8) * $3::float8) AS t, avg(${m})::real AS v FROM telemetry
-          WHERE device_id=$1 AND ts >= now() - make_interval(mins => $2::int) AND ${m} IS NOT NULL GROUP BY 1 ORDER BY 1`, [d.id, mins, Math.max(30, (mins * 60) / 12)])
+      ? (await col('telemetry').aggregate([
+        { $match: { deviceId: d.id, ts: { $gte: since }, [m]: { $ne: null } } },
+        { $group: { _id: { $floor: { $divide: [{ $toLong: '$ts' }, bucketMs] } }, v: { $avg: `$${m}` } } },
+        { $sort: { _id: 1 } },
+      ]).toArray()).map((p) => ({ t: new Date((p._id as number) * bucketMs), v: p.v as number }))
       : [];
-    stats.push({ metric: m, ...s, last: last?.v, sample });
-    lines.push(`${METRICS[m].label} over the last ${mins} min: min ${n1(s.lo)}${unitOf(m)}, average ${n1(s.mean)}${unitOf(m)}, max ${n1(s.hi)}${unitOf(m)}, latest ${n1(last?.v)}${unitOf(m)} (${s.n} readings)`);
-    if (sample.length) lines.push(`  trend: ${sample.map((p: any) => `${new Date(p.t).toISOString().slice(11, 16)}Z ${n1(p.v)}`).join(', ')}`);
+    stats.push({ metric: m, n: s.n, lo: s.lo, mean: s.mean, hi: s.hi, last: last?.[m], sample });
+    lines.push(`${METRICS[m].label} over the last ${mins} min: min ${n1(s.lo)}${unitOf(m)}, average ${n1(s.mean)}${unitOf(m)}, max ${n1(s.hi)}${unitOf(m)}, latest ${n1(last?.[m])}${unitOf(m)} (${s.n} readings)`);
+    if (sample.length) lines.push(`  trend: ${sample.map((p) => `${p.t.toISOString().slice(11, 16)}Z ${n1(p.v)}`).join(', ')}`);
   }
   if (!lines.length) lines.push('No readings were stored for that signal in the requested period.');
   return { tool: 'telemetry_history', title: `${metric ? METRICS[metric].label : 'Telemetry'} history: ${label(d)}`, facts: lines.join('\n'), asOf: iso(), simulated: d.simulated, device: { id: d.id, name: d.name, assetNo: d.assetNo }, data: stats };
@@ -241,7 +283,7 @@ export async function telemetryHistory(d: DeviceRef, metric: MetricKey | null, m
 export async function anomalyHistory(d: DeviceRef): Promise<ToolResult> {
   const [snaps, alerts] = await Promise.all([
     listPredictionHistory({ deviceId: d.id, limit: 10 }),
-    q<any>(`SELECT severity, metric, message, status, created_at FROM alerts WHERE device_id=$1 AND type='predictive' ORDER BY created_at DESC LIMIT 10`, [d.id]),
+    col('alerts').find({ deviceId: d.id, type: 'predictive' }, { projection: { severity: 1, metric: 1, message: 1, status: 1, createdAt: 1 } }).sort({ createdAt: -1 }).limit(10).toArray(),
   ]);
   const lines = [
     snaps.length

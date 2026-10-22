@@ -1,5 +1,5 @@
 import { config } from '../config';
-import { q } from '../db';
+import { col } from '../mongo';
 import { emptyMetrics, METRIC_KEYS, METRICS, MetricKey, Metrics } from '../ml/metrics';
 import { pick, rand } from '../util';
 import { baselinesFor } from './deviceTypes';
@@ -134,7 +134,7 @@ export function startSimulator() {
   const tick = async () => {
     if (paused) return;
     try {
-      const devs = await q<{ id: string; type: string }>('SELECT id, type FROM devices WHERE simulated AND active');
+      const devs = (await col('devices').find({ simulated: true, active: { $ne: false } }, { projection: { type: 1 } }).toArray()).map((d) => ({ id: d._id as unknown as string, type: d.type as string }));
       for (const d of devs) await ensureState(d);
       for (const id of sims.keys()) if (!devs.find((d) => d.id === id)) sims.delete(id);
 
@@ -165,7 +165,7 @@ export function startSimulator() {
   // kick off two faults shortly after boot so the demo has something to predict
   setTimeout(async () => {
     try {
-      const devs = await q<{ id: string; type: string }>('SELECT id, type FROM devices WHERE simulated AND active ORDER BY random() LIMIT 2');
+      const devs = (await col('devices').aggregate([{ $match: { simulated: true, active: { $ne: false } } }, { $sample: { size: 2 } }, { $project: { type: 1 } }]).toArray()).map((d) => ({ id: d._id as unknown as string, type: d.type as string }));
       for (const d of devs) await startFault(await ensureState(d));
     } catch (e) {
       console.error('[sim]', e);

@@ -2,7 +2,7 @@
 
 Legend: ✅ verified working (how it was verified is stated) · 🟡 partial · ❌ missing · ⛔ blocked · ⏳ in progress
 
-_Audit date: 2026-10-15 · Completion update: 2026-10-19 (backend 176 / frontend 39 / end-to-end 13 tests passing) · Baseline verified by running `npm test` (87 backend + 17 frontend tests, all passing), both typechecks, both production builds and the Docker stack._
+_Audit date: 2026-10-15 · Completion update: 2026-10-19 (backend 176 / frontend 39 / end-to-end 13 tests passing, including after the MongoDB split) · Baseline verified by running `npm test` (87 backend + 17 frontend tests, all passing), both typechecks, both production builds and the Docker stack._
 
 ## Phase 1 - Audit of the existing codebase
 
@@ -67,6 +67,25 @@ _Audit date: 2026-10-15 · Completion update: 2026-10-19 (backend 176 / frontend
 | Human-friendly device numbers (`asset_no`) | ✅ unique, searchable (`platform2.test.ts`) |
 | Secure JWT secret default (generated and persisted, never hard-coded) | ✅ implemented in `config.ts`; compose passes an empty value; generated file verified on first start |
 | Dashboard: machine-type filter, risk distribution, empty-state check | ✅ filter + empty type return zeros (`platform2.test.ts`); risk distribution browser-checked. Full empty-database check is part of the Playwright suite |
+
+## MongoDB split (branch `mongodb-migration`, 2026-10-19)
+
+Requested: operational data in MongoDB; PostgreSQL (pgvector) only for the RAG part.
+
+| Item | Status | Evidence |
+|---|---|---|
+| MongoDB 7 in Docker Compose (auth, healthcheck, volume, localhost-only port) | ✅ | `docker compose up -d mongo` healthy; `docker compose config` valid |
+| Data layer ported: users, devices, telemetry (TTL index), machine types, rules, alerts, firmware, incidents, webhooks, maintenance, prediction history, model versions, audit log, simulator, sweeper, dashboard | ✅ | backend API suite passes on MongoDB: 176 passed / 3 skipped |
+| Assistant tools and reports ported to MongoDB queries; knowledge base joins (owner names, chat device names) resolved in the application | ✅ | `assistant.test.ts`, `reports.test.ts`, end-to-end step 09-12 |
+| PostgreSQL migration 004 removes cross-database foreign keys | ✅ | `platform2.test.ts` |
+| Existing data copied: `npm run migrate:to-mongo` (ids preserved, idempotent, dry-run, never deletes) | ✅ | real data: 18 devices, 100,614 readings, 1,408 alerts, 1,462 predictions copied with exact counts; second run added nothing |
+| New backend running against the migrated data | ✅ | dashboard, device list and predictions return the migrated fleet |
+| End-to-end (13 steps) on MongoDB | ✅ | 13 passed |
+| Frontend | ✅ unchanged | API response shapes were kept; 39 frontend tests pass |
+| CI workflow has a MongoDB service for the backend and end-to-end jobs | 🟡 | written, not run on GitHub |
+| Fresh PostgreSQL installs still create the old, now unused operational tables (migrations 001/002 are history) | 🟡 | harmless; documented in `DATABASE_SCHEMA.md` |
+| Old PostgreSQL operational tables | kept | deliberately not dropped - they are the backup until you decide |
+| Docker images (backend/frontend) rebuilt with the MongoDB code and started | see below | |
 
 ## Phase 3 - RAG infrastructure
 

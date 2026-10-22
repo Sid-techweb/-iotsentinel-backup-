@@ -1,0 +1,32 @@
+devices 18 pump pump-station-01 cnc cnc-plantA-01
+waiting for documents to be indexed and the simulator to produce activity...
+saved 01-login
+saved 02-register
+saved 03-dashboard
+saved 04-devices
+saved 05-device-detail
+saved 06-alerts
+saved 07-anomaly-prediction
+saved 08-activity
+saved 09-machine-types
+saved 10-alert-rules
+saved 11-firmware
+saved 12-incidents
+saved 13-knowledge-base
+node:internal/modules/run_main:107
+    triggerUncaughtException(
+    ^
+
+locator.waitFor: Timeout 180000ms exceeded.
+Call log:
+[2m  - waiting for locator('.msg.assistant .bubble').last().getByRole('button', { name: /Copy answer/ }) to be visible[22m
+
+    at ask (C:\Users\Siddharth\Desktop\FSD Project\report\make_screenshots.mjs:93:59)
+    at async file:///C:/Users/Siddharth/Desktop/FSD%20Project/report/make_screenshots.mjs:97:1 {
+  log: [
+    "  - waiting for locator('.msg.assistant .bubble').last().getByRole('button', { name: /Copy answer/ }) to be visible"
+  ],
+  name: 'TimeoutError'
+}
+
+Node.js v24.21.0

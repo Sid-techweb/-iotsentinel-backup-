@@ -2,7 +2,7 @@
 
 ## Requirements
 
-* Docker with Compose v2 (or Node 22 + a local PostgreSQL 16 **with pgvector** and Redis for development).
+* Docker with Compose v2 (or Node 22 + a local MongoDB 7, PostgreSQL 16 **with pgvector** and Redis for development).
 * For the AI assistant: [Ollama](https://ollama.com) with a chat model and an embedding model. Everything else works without it.
 
 ## 1. Start the platform
@@ -16,7 +16,8 @@ docker compose up -d --build
 |---|---|
 | Dashboard | http://localhost:8080 |
 | REST API | http://localhost:4000/api |
-| PostgreSQL | localhost:5433 (local only) |
+| MongoDB | localhost:27017 (local only) - operational data |
+| PostgreSQL | localhost:5433 (local only) - knowledge base and chats |
 
 The first account you create becomes the administrator. The backend applies migrations, seeds a demo fleet (18 devices, 8 machine types) and starts the simulator unless `SIMULATOR=false`.
 The PostgreSQL image is built locally from `docker/postgres/Dockerfile` (PostgreSQL 16 + pgvector 0.8.1). Existing data volumes keep working.
@@ -51,7 +52,7 @@ Without a reachable Ollama the app still works: the assistant says the model ser
 ## Local development
 
 ```bash
-docker compose up -d postgres redis
+docker compose up -d mongo postgres redis
 cd backend  && npm install && npm run dev      # http://localhost:4000
 cd frontend && npm install && npm run dev      # http://localhost:5173 (proxies /api)
 ```
@@ -62,7 +63,10 @@ Set `LLM_MODEL=<installed model>` in the environment of the backend if you do no
 
 | Variable | Default | Notes |
 |---|---|---|
-| `DATABASE_URL`, `REDIS_URL` | compose values | |
+| `MONGO_URL` | `mongodb://iot:iot@localhost:27017/iotmonitor?authSource=admin` | Operational data |
+| `DATABASE_URL` | `postgres://iot:iot@localhost:5433/iotmonitor` | Knowledge base and chats (pgvector) |
+| `REDIS_URL` | compose value | |
+| `MONGO_PASSWORD`, `POSTGRES_PASSWORD` | `iot` | Passwords for the two database containers (set in `.env`) |
 | `JWT_SECRET` | generated once and kept in the data volume | Set explicitly for multi-instance deployments |
 | `SIMULATOR` | `true` | Built-in demo devices |
 | `CORS_ORIGIN` | `http://localhost:8080` | Dashboard origin |
@@ -77,15 +81,28 @@ Set `LLM_MODEL=<installed model>` in the environment of the backend if you do no
 | `ASSISTANT_MSG_PER_MIN`, `REPORTS_PER_MIN`, `API_RATE_PER_MIN` | 20, 20, 600 | |
 | `REPORT_MAX_ROWS`, `REPORT_PDF_MAX_ROWS` | 500000, 1000 | |
 
-Data volumes: `pgdata` (database), `appdata` (uploaded documents and the generated secret), `modelsdata` (trained models). `docker compose down` keeps them; `down -v` deletes everything.
+Data volumes: `mongodata` (operational data), `pgdata` (knowledge base), `appdata` (uploaded documents and the generated secret), `modelsdata` (trained models). `docker compose down` keeps them; `down -v` deletes everything.
 
 ## Production notes
 
 * Terminate HTTPS in front of nginx (a TLS proxy or load balancer). Cookies are not used; tokens travel in the `Authorization` header, so always use HTTPS in production.
 * nginx is configured for streamed assistant answers (no buffering, 5-minute timeout), 12 MB uploads on `/api/knowledge`, and long-running report exports.
-* Back up the `pgdata` and `appdata` volumes together (documents on disk and their rows must stay in step).
+* Back up `mongodata`, `pgdata` and `appdata` together (documents on disk and their rows must stay in step; users and devices referenced by chats live in MongoDB). Example: `docker compose exec mongo mongodump -u iot -p <password> --authenticationDatabase admin --archive > mongo.archive` and `pg_dump` for PostgreSQL.
 * Low-memory hosts: the containers have memory limits (`mem_limit`); PostgreSQL 1 GB, backend 1 GB.
 
 ## Upgrading
 
-Pull the new code and `docker compose up -d --build`. Migrations run automatically and only apply what is new; take a `pg_dump` first if the data matters.
+Pull the new code and `docker compose up -d --build`. PostgreSQL migrations run automatically and only apply what is new; MongoDB indexes are ensured at start-up. Take backups first if the data matters.
+
+## Moving an existing installation to MongoDB
+
+Installations created before the MongoDB split keep their operational data in PostgreSQL. To move it:
+
+1. Back up: `pg_dump -Fc` of the old database.
+2. Start MongoDB: `docker compose up -d mongo` (and keep PostgreSQL running).
+3. Stop the old backend so no new readings are written during the copy.
+4. Copy: `cd backend && npm run migrate:to-mongo` (add `-- --dry-run` first to see the row counts). Ids are preserved, so existing documents and chats still point at the right users and devices. It is idempotent: running it again does not duplicate anything.
+5. Start the new backend. The first start applies PostgreSQL migration 004.
+6. Check the dashboard, then (optionally, when you are satisfied) drop the old PostgreSQL tables yourself. The tool never deletes anything.
+
+Telemetry older than `TELEMETRY_RETENTION_DAYS` is copied but MongoDB's TTL index removes it shortly afterwards.

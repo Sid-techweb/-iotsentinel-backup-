@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { q } from '../db';
+import { col, toApi, toApiList } from '../mongo';
+import { withDevice } from '../services/deviceQueries';
 import { publish } from '../services/events';
 import { audit, ctxOf } from '../services/audit';
 import { asyncH, HttpError, toCsv } from '../util';
@@ -9,18 +10,24 @@ export const alertsRouter = Router();
 
 async function listAlerts(query: Record<string, string | undefined>, limit: number) {
   const { status, severity, type, deviceId, rangeSec } = query;
-  const where: string[] = [];
-  const params: unknown[] = [];
-  if (status === 'active') where.push(`a.status <> 'resolved'`);
-  else if (status) { params.push(status); where.push(`a.status = $${params.length}`); }
-  if (severity) { params.push(severity); where.push(`a.severity = $${params.length}`); }
-  if (type) { params.push(type); where.push(`a.type = $${params.length}`); }
-  if (deviceId) { params.push(deviceId); where.push(`a.device_id = $${params.length}`); }
-  if (rangeSec) { params.push(Number(rangeSec)); where.push(`(a.status <> 'resolved' OR a.resolved_at > now() - make_interval(secs => $${params.length}::float8))`); }
-  return q(
-    `SELECT a.*, d.name AS device_name, d.type AS device_type FROM alerts a JOIN devices d ON d.id=a.device_id
-     ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
-     ORDER BY (a.status='resolved'), a.created_at DESC LIMIT ${limit}`, params);
+  const filter: Record<string, unknown> = {};
+  if (status === 'active') filter.status = { $ne: 'resolved' };
+  else if (status) filter.status = status;
+  if (severity) filter.severity = severity;
+  if (type) filter.type = type;
+  if (deviceId) filter.deviceId = deviceId;
+  if (rangeSec) {
+    const since = new Date(Date.now() - Number(rangeSec) * 1000);
+    filter.$or = [{ status: { $ne: 'resolved' } }, { resolvedAt: { $gt: since } }];
+  }
+  const rows = await col('alerts').aggregate([
+    { $match: filter },
+    { $addFields: { isResolved: { $eq: ['$status', 'resolved'] } } }, // open alerts first, newest first inside each group
+    { $sort: { isResolved: 1, createdAt: -1 } },
+    { $limit: limit },
+    { $project: { isResolved: 0 } },
+  ]).toArray();
+  return withDevice(toApiList(rows));
 }
 
 alertsRouter.get('/', asyncH(async (req, res) => {
@@ -40,12 +47,11 @@ alertsRouter.get('/export.csv', asyncH(async (req, res) => {
 
 alertsRouter.patch('/:id', asyncH(async (req, res) => {
   const { status } = z.object({ status: z.enum(['acknowledged', 'resolved']) }).parse(req.body);
-  const rows = await q(
-    `UPDATE alerts SET status=$2, resolved_at = CASE WHEN $2='resolved' THEN now() ELSE resolved_at END WHERE id=$1 RETURNING *`,
-    [req.params.id, status],
-  );
-  if (!rows.length) throw new HttpError(404, 'Alert not found');
-  publish('alert', { id: rows[0].id });
+  const set: Record<string, unknown> = { status };
+  if (status === 'resolved') set.resolvedAt = new Date();
+  const row = await col('alerts').findOneAndUpdate({ _id: Number(req.params.id) as any }, { $set: set }, { returnDocument: 'after' });
+  if (!row) throw new HttpError(404, 'Alert not found');
+  publish('alert', { id: row._id });
   audit(ctxOf(req), 'alert.' + status, 'alert', req.params.id);
-  res.json(rows[0]);
+  res.json(toApi(row));
 }));

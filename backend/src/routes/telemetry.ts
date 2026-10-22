@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { q1 } from '../db';
+import { col } from '../mongo';
 import { ingest } from '../services/ingest';
 import { asyncH, HttpError, hashKey } from '../util';
 
@@ -21,10 +21,10 @@ const bodySchema = z.object({
 
 async function authDevice(key: unknown) {
   if (typeof key !== 'string' || !key) throw new HttpError(401, 'Missing x-api-key header');
-  const dev = await q1<{ id: string; active: boolean }>('SELECT id, active FROM devices WHERE api_key_hash=$1', [hashKey(key)]);
+  const dev = await col('devices').findOne({ apiKeyHash: hashKey(key) }, { projection: { active: 1 } });
   if (!dev) throw new HttpError(401, 'Unknown device key');
-  if (!dev.active) throw new HttpError(403, 'This device has been deactivated');
-  return dev.id;
+  if (dev.active === false) throw new HttpError(403, 'This device has been deactivated');
+  return dev._id as unknown as string;
 }
 
 telemetryRouter.post('/', asyncH(async (req, res) => {

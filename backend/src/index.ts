@@ -1,6 +1,7 @@
 import { createApp } from './app';
 import { config } from './config';
 import { migrate, pool } from './db';
+import { ensureIndexes, mongo, pingMongo } from './mongo';
 import { loadModel } from './ml/model';
 import { redis } from './redis';
 import { startIngestionWorker, syncSystemDocs } from './services/kb/ingest';
@@ -19,8 +20,10 @@ async function waitFor(name: string, fn: () => Promise<unknown>) {
 }
 
 async function main() {
+  await waitFor('mongodb', () => pingMongo());
   await waitFor('postgres', () => pool.query('SELECT 1'));
   await waitFor('redis', () => redis.ping());
+  await ensureIndexes();
   await migrate();
   const newTypes = await ensureReferenceData();
   loadModel();
@@ -41,7 +44,7 @@ async function main() {
     if (ingestion) clearInterval(ingestion);
     if (sim) clearInterval(sim);
     void stopEventBus();
-    server.close(() => Promise.all([pool.end(), redis.quit()]).finally(() => process.exit(0)));
+    server.close(() => Promise.all([pool.end(), mongo.close(), redis.quit()]).finally(() => process.exit(0)));
     setTimeout(() => process.exit(0), 3000).unref(); // open SSE streams must not block shutdown
   };
   process.on('SIGINT', shutdown);

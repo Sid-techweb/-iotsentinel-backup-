@@ -1,3 +1,4 @@
+import { MongoClient } from 'mongodb';
 import { Client } from 'pg';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -15,6 +16,13 @@ const E2E_DB = process.env.DATABASE_URL ?? 'postgres://iot:iot@localhost:5433/io
   await admin.query(`DROP DATABASE IF EXISTS ${name}`);
   await admin.query(`CREATE DATABASE ${name}`);
   await admin.end();
+  const mongoUrl = process.env.MONGO_URL ?? 'mongodb://iot:iot@localhost:27017/iotmonitor_e2e?authSource=admin';
+  const mongoName = new URL(mongoUrl).pathname.slice(1);
+  if (!/e2e/.test(mongoName)) throw new Error(`Refusing to reset MongoDB database "${mongoName}": its name must contain "e2e"`);
+  const mongo = new MongoClient(mongoUrl);
+  await mongo.connect();
+  await mongo.db(mongoName).dropDatabase();
+  await mongo.close();
   fs.rmSync(path.resolve(process.cwd(), '.e2e-data'), { recursive: true, force: true });
 
   // empty the e2e Redis database too (db 2 - not the app's db 0, nor the unit tests' db 1)

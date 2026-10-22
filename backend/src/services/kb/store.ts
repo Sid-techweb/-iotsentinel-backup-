@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import { col } from '../../mongo';
 import { config } from '../../config';
 import { pool, q, q1 } from '../../db';
 import { HttpError } from '../../util';
@@ -19,8 +20,16 @@ export function accessPredicate(user: Viewer, params: unknown[], alias = 'd'): s
   return `(${alias}.owner_id = $${params.length} OR ${alias}.visibility = 'shared')`;
 }
 
-const DOC_COLUMNS = `d.id, d.owner_id, u.name AS owner_name, d.source, d.title, d.original_name, d.mime, d.size_bytes, d.sha256, d.visibility,
+const DOC_COLUMNS = `d.id, d.owner_id, d.source, d.title, d.original_name, d.mime, d.size_bytes, d.sha256, d.visibility,
   d.status, d.error, d.attempts, d.pages, d.chunk_count, d.embedding_model, d.embedding_dim, d.created_at, d.updated_at, d.ingested_at`;
+
+/** Owner names live with the users in MongoDB, so they are attached here rather than joined in SQL. */
+async function withOwners<T extends { ownerId?: string | null }>(rows: T[]): Promise<(T & { ownerName: string | null })[]> {
+  const ids = [...new Set(rows.map((r) => r.ownerId).filter((x): x is string => !!x))];
+  const users = ids.length ? await col('users').find({ _id: { $in: ids as any[] } }, { projection: { name: 1 } }).toArray() : [];
+  const names = new Map(users.map((u) => [u._id as unknown as string, u.name as string]));
+  return rows.map((r) => ({ ...r, ownerName: r.ownerId ? names.get(r.ownerId) ?? null : null }));
+}
 
 const withEdit = (user: Viewer, d: any) => ({ ...d, canEdit: d.source === 'upload' && (user.role === 'admin' || d.ownerId === user.id) });
 
@@ -29,15 +38,15 @@ export async function listDocuments(user: Viewer, f: { q?: string; status?: stri
   const where = [accessPredicate(user, params)];
   if (f.status) { params.push(f.status); where.push(`d.status = $${params.length}`); }
   if (f.q) { params.push(`%${f.q}%`); where.push(`(d.title ILIKE $${params.length} OR d.original_name ILIKE $${params.length})`); }
-  const rows = await q(`SELECT ${DOC_COLUMNS} FROM kb_documents d LEFT JOIN users u ON u.id = d.owner_id WHERE ${where.join(' AND ')} ORDER BY d.created_at DESC LIMIT 500`, params);
-  return rows.map((d) => withEdit(user, d));
+  const rows = await q(`SELECT ${DOC_COLUMNS} FROM kb_documents d WHERE ${where.join(' AND ')} ORDER BY d.created_at DESC LIMIT 500`, params);
+  return (await withOwners(rows)).map((d) => withEdit(user, d));
 }
 
 export async function getDocument(user: Viewer, id: string) {
   const params: unknown[] = [id];
-  const row = await q1(`SELECT ${DOC_COLUMNS} FROM kb_documents d LEFT JOIN users u ON u.id = d.owner_id WHERE d.id = $1 AND ${accessPredicate(user, params)}`, params).catch(() => undefined);
+  const row = await q1(`SELECT ${DOC_COLUMNS} FROM kb_documents d WHERE d.id = $1 AND ${accessPredicate(user, params)}`, params).catch(() => undefined);
   if (!row) throw new HttpError(404, 'Document not found'); // never reveal that an inaccessible document exists
-  return withEdit(user, row);
+  return withEdit(user, (await withOwners([row]))[0]);
 }
 
 /** A document the user may change (owner or admin; system documentation is read-only here). */

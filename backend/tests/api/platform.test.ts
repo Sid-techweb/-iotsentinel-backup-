@@ -4,7 +4,7 @@ import request from 'supertest';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createApp } from '../../src/app';
 import { config } from '../../src/config';
-import { pool } from '../../src/db';
+import { col } from '../../src/mongo';
 import { rateLimit } from '../../src/middleware/rateLimit';
 import { publish, startEventBus, stopEventBus } from '../../src/services/events';
 import { api, bearer, bootstrap, eventually, newDevice, newUser, sleep, uid } from '../helpers';
@@ -29,7 +29,7 @@ describe('user management', () => {
   });
 
   it('never lets the last administrator be removed', async () => {
-    await pool.query("DELETE FROM users WHERE role='admin'"); // start from a clean slate for this scenario
+    await col('users').deleteMany({ role: 'admin' }); // start from a clean slate for this scenario
     const only = await newUser('admin');
     expect((await api().patch(`/api/users/${only.user.id}`).set(bearer(only.token)).send({ role: 'viewer' })).status).toBe(409);
     expect((await api().delete(`/api/users/${only.user.id}`).set(bearer(only.token))).status).toBe(409); // also: not yourself

@@ -1,4 +1,4 @@
-import { q, q1 } from '../db';
+import { col } from '../mongo';
 import { DEFAULT_BASELINE, METRIC_KEYS, MetricKey } from '../ml/metrics';
 
 export interface DeviceType {
@@ -24,7 +24,7 @@ export const DEFAULT_TYPES: { name: string; description: string; baselines: Part
 let memo: { at: number; rows: DeviceType[] } | null = null;
 
 const fromRow = (r: any): DeviceType => ({
-  id: r.id,
+  id: r._id,
   name: r.name,
   description: r.description,
   metrics: (r.metrics as string[]).filter((m): m is MetricKey => (METRIC_KEYS as readonly string[]).includes(m)),
@@ -33,7 +33,7 @@ const fromRow = (r: any): DeviceType => ({
 
 export async function getDeviceTypes(): Promise<DeviceType[]> {
   if (memo && Date.now() - memo.at < 10_000) return memo.rows;
-  const rows = (await q('SELECT * FROM device_types ORDER BY name')).map(fromRow);
+  const rows = (await col('device_types').find({}).sort({ name: 1 }).toArray()).map(fromRow);
   memo = { at: Date.now(), rows };
   return rows;
 }
@@ -59,7 +59,7 @@ const deviceTypeCache = new Map<string, { type: string; at: number }>();
 export async function deviceTypeOf(deviceId: string): Promise<string | null> {
   const hit = deviceTypeCache.get(deviceId);
   if (hit && Date.now() - hit.at < 60_000) return hit.type;
-  const row = await q1<{ type: string }>('SELECT type FROM devices WHERE id=$1', [deviceId]);
+  const row = await col('devices').findOne({ _id: deviceId as any }, { projection: { type: 1 } });
   if (!row) return null;
   deviceTypeCache.set(deviceId, { type: row.type, at: Date.now() });
   return row.type;

@@ -1,10 +1,10 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 import { config } from '../../src/config';
-import { pool } from '../../src/db';
+import { col } from '../../src/mongo';
 import { ingest } from '../../src/services/ingest';
 import { sweepOnce } from '../../src/services/sweeper';
 import { keys, redis } from '../../src/redis';
-import { api, bearer, bootstrap, eventually, newDevice, newUser } from '../helpers';
+import { api, bearer, bootstrap, newDevice, newUser } from '../helpers';
 
 let admin: Awaited<ReturnType<typeof newUser>>;
 beforeAll(async () => { await bootstrap(); admin = await newUser('admin'); });
@@ -126,11 +126,9 @@ describe('data retention', () => {
     expect(config.retentionDays).toBeGreaterThan(0);
   });
 
-  it('can purge old telemetry with the same query the sweeper uses', async () => {
-    const dev = await newDevice(admin.token);
-    await pool.query("INSERT INTO telemetry (device_id, ts, cpu) VALUES ($1, now() - interval '30 days', 5), ($1, now(), 6)", [dev.id]);
-    await pool.query('DELETE FROM telemetry WHERE ts < now() - make_interval(days => $1::int)', [config.retentionDays]);
-    const left = await eventually(async () => (await pool.query('SELECT cpu FROM telemetry WHERE device_id=$1', [dev.id])).rows);
-    expect(left.map((r: any) => r.cpu)).toEqual([6]);
+  it('expires old telemetry with a MongoDB TTL index set to the retention window', async () => {
+    const indexes = await col('telemetry').indexes();
+    const ttl = indexes.find((i) => i.key?.ts === 1 && i.expireAfterSeconds !== undefined);
+    expect(ttl?.expireAfterSeconds).toBe(config.retentionDays * 86_400);
   });
 });

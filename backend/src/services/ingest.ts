@@ -1,5 +1,5 @@
 import { config } from '../config';
-import { q } from '../db';
+import { col } from '../mongo';
 import { emptyMetrics, METRIC_KEYS, METRICS, MetricKey } from '../ml/metrics';
 import { ALERT_PROB } from '../ml/model';
 import { keys, RECENT_MAX, redis } from '../redis';
@@ -14,12 +14,10 @@ export type MetricInput = Partial<Record<MetricKey, number | null>>;
 
 const fmtEta = (s: number) => (s < 90 ? `${Math.round(s)}s` : `${(s / 60).toFixed(1)} min`);
 
-const INSERT_SQL = `INSERT INTO telemetry (device_id, ts, ${METRIC_KEYS.join(', ')}) VALUES ($1, $2, ${METRIC_KEYS.map((_, i) => `$${i + 3}`).join(', ')})`;
-
 /**
  * Single entry point for every heartbeat / telemetry reading, whether it comes from
  * the REST API (real device) or the built-in simulator:
- *   1. persist the reading            (PostgreSQL)
+ *   1. persist the reading            (MongoDB)
  *   2. refresh liveness + hot state   (Redis)
  *   3. evaluate threshold rules       -> threshold alerts (limits of the device's machine type)
  *   4. run the anomaly predictor      -> predictive alerts (before the breach)
@@ -32,7 +30,7 @@ export async function ingest(deviceId: string, input: MetricInput = {}, ts = new
   const type = await deviceTypeOf(deviceId);
 
   if (hasMetrics) {
-    await q(INSERT_SQL, [deviceId, ts, ...METRIC_KEYS.map((k) => m[k])]);
+    await col('telemetry').insertOne({ deviceId, ts, ...m });
     const point = JSON.stringify({ ts: ts.getTime(), ...m });
     await redis
       .multi()
@@ -85,6 +83,6 @@ export async function ingest(deviceId: string, input: MetricInput = {}, ts = new
     }
   }
 
-  await q(`UPDATE devices SET last_seen=$2, status=$3 WHERE id=$1`, [deviceId, ts, degraded ? 'degraded' : 'online']);
+  await col('devices').updateOne({ _id: deviceId as any }, { $set: { lastSeen: ts, status: degraded ? 'degraded' : 'online' } });
   publishTick();
 }

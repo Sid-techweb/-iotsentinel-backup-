@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { q, q1 } from '../db';
+import { col, nextId, toApi } from '../mongo';
 import { forgetModel } from '../ml/model';
 import { METRIC_KEYS } from '../ml/metrics';
 import { getDeviceType, getDeviceTypes, invalidateDeviceTypes } from '../services/deviceTypes';
@@ -14,11 +14,13 @@ const metricList = z.array(z.enum(METRIC_KEYS)).min(1, 'Choose at least one sign
   .transform((m) => [...new Set(m)]);
 
 deviceTypesRouter.get('/', asyncH(async (_req, res) => {
-  const [types, counts, models] = await Promise.all([
+  const [types, countRows, modelRows] = await Promise.all([
     getDeviceTypes(),
-    q<{ type: string; n: number }>('SELECT type, count(*)::int AS n FROM devices GROUP BY type'),
-    q<{ scope: string; source: string; samples: number; trainedAt: string }>('SELECT scope, source, samples, trained_at FROM models'),
+    col('devices').aggregate([{ $group: { _id: '$type', n: { $sum: 1 } } }]).toArray(),
+    col('models').find({}, { projection: { source: 1, samples: 1, trainedAt: 1 } }).toArray(),
   ]);
+  const counts = countRows.map((c) => ({ type: c._id as string, n: c.n as number }));
+  const models = modelRows.map((m) => ({ scope: m._id as unknown as string, source: m.source, samples: m.samples, trainedAt: m.trainedAt }));
   res.json(types.map((t) => ({
     ...t,
     deviceCount: counts.find((c) => c.type === t.name)?.n ?? 0,
@@ -35,33 +37,40 @@ deviceTypesRouter.post('/', asyncH(async (req, res) => {
   }).parse(req.body);
   if (await getDeviceType(b.name)) throw new HttpError(409, `A machine type named "${b.name}" already exists`);
   const baselines = Object.fromEntries(Object.entries(b.baselines).filter(([k]) => (b.metrics as string[]).includes(k)));
-  const row = await q1('INSERT INTO device_types (name, description, metrics, baselines) VALUES ($1,$2,$3,$4) RETURNING *', [b.name, b.description, b.metrics, JSON.stringify(baselines)]);
+  const row = { _id: (await nextId('device_types')) as any, name: b.name, description: b.description, metrics: b.metrics, baselines, createdAt: new Date() };
+  try { await col('device_types').insertOne(row); } catch (e) {
+    if ((e as { code?: number }).code === 11000) throw new HttpError(409, `A machine type named "${b.name}" already exists`);
+    throw e;
+  }
   invalidateDeviceTypes();
-  audit(ctxOf(req), 'device_type.create', 'device_type', (row as any).id, { name: b.name, metrics: b.metrics });
-  res.status(201).json(row);
+  audit(ctxOf(req), 'device_type.create', 'device_type', row._id, { name: b.name, metrics: b.metrics });
+  res.status(201).json(toApi(row));
 }));
 
 /** Change which signals a machine type reports (the name is fixed because devices reference it). */
 deviceTypesRouter.put('/:id', asyncH(async (req, res) => {
   const b = z.object({ description: z.string().trim().max(200).optional(), metrics: metricList.optional() }).parse(req.body);
-  const row = await q1(
-    'UPDATE device_types SET description=COALESCE($2, description), metrics=COALESCE($3, metrics) WHERE id=$1 RETURNING *',
-    [req.params.id, b.description ?? null, b.metrics ?? null],
-  );
+  const set: Record<string, unknown> = {};
+  if (b.description !== undefined) set.description = b.description;
+  if (b.metrics !== undefined) set.metrics = b.metrics;
+  const id = Number(req.params.id);
+  const row = Object.keys(set).length
+    ? await col('device_types').findOneAndUpdate({ _id: id as any }, { $set: set }, { returnDocument: 'after' })
+    : await col('device_types').findOne({ _id: id as any });
   if (!row) throw new HttpError(404, 'Machine type not found');
   invalidateDeviceTypes();
   audit(ctxOf(req), 'device_type.update', 'device_type', req.params.id, { changed: Object.keys(b) });
-  res.json(row);
+  res.json(toApi(row));
 }));
 
 deviceTypesRouter.delete('/:id', asyncH(async (req, res) => {
-  const t = await q1<{ name: string }>('SELECT name FROM device_types WHERE id=$1', [req.params.id]);
+  const t = await col('device_types').findOne({ _id: Number(req.params.id) as any });
   if (!t) throw new HttpError(404, 'Machine type not found');
-  const used = await q1<{ n: number }>('SELECT count(*)::int AS n FROM devices WHERE type=$1', [t.name]);
-  if (used && used.n > 0) throw new HttpError(409, `${used.n} device(s) still use this machine type - move or remove them first`);
-  await q('DELETE FROM rules WHERE device_type=$1', [t.name]);
-  await q('DELETE FROM models WHERE scope=$1', [t.name]);
-  await q('DELETE FROM device_types WHERE id=$1', [req.params.id]);
+  const used = await col('devices').countDocuments({ type: t.name });
+  if (used > 0) throw new HttpError(409, `${used} device(s) still use this machine type - move or remove them first`);
+  await col('rules').deleteMany({ deviceType: t.name });
+  await col('models').deleteOne({ _id: t.name as any });
+  await col('device_types').deleteOne({ _id: t._id });
   forgetModel(t.name);
   invalidateRules();
   invalidateDeviceTypes();

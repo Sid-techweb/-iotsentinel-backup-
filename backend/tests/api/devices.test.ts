@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { pool } from '../../src/db';
+import { col } from '../../src/mongo';
 import { api, bearer, bootstrap, newDevice, newUser, uid } from '../helpers';
 
 let admin: Awaited<ReturnType<typeof newUser>>;
@@ -14,10 +14,10 @@ describe('devices and device keys', () => {
     expect(detail.status).toBe(200);
     expect(detail.body).not.toHaveProperty('apiKey');
 
-    const row = (await pool.query('SELECT api_key, api_key_hash FROM devices WHERE id=$1', [dev.id])).rows[0];
-    expect(row.api_key).toBeNull();
-    expect(row.api_key_hash).toMatch(/^[0-9a-f]{64}$/);
-    expect(row.api_key_hash).not.toContain(dev.apiKey);
+    const row = (await col('devices').findOne({ _id: dev.id }))!;
+    expect(row.apiKey).toBeUndefined();
+    expect(row.apiKeyHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(row.apiKeyHash).not.toContain(dev.apiKey);
   });
 
   it('validates new devices', async () => {
@@ -72,7 +72,7 @@ describe('devices and device keys', () => {
     await api().post('/api/telemetry').set('x-api-key', dev.apiKey).send({ cpu: 10 });
     expect((await api().delete(`/api/devices/${dev.id}`).set(bearer(admin.token))).status).toBe(204);
     expect((await api().get(`/api/devices/${dev.id}`).set(bearer(admin.token))).status).toBe(404);
-    expect((await pool.query('SELECT count(*)::int AS n FROM telemetry WHERE device_id=$1', [dev.id])).rows[0].n).toBe(0);
+    expect(await col('telemetry').countDocuments({ deviceId: dev.id })).toBe(0);
   });
 
   it('exports the inventory as CSV', async () => {

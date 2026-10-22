@@ -11,6 +11,7 @@
     "@types/node": "^22.0.0",
     "@types/pg": "^8.15.0",
     "ioredis": "^6.0.0",
+    "mongodb": "^7.7.0",
     "pg": "^8.16.0",
     "typescript": "^5.9.0"
   }

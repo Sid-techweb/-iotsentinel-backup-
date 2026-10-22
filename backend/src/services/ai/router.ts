@@ -13,9 +13,14 @@ export interface Plan {
   metric: MetricKey | null;
   tools: PlannedTool[];
   needsDevice: boolean;       // the question is about "a device" but none could be identified
+  docOnly: boolean;           // the user points at an uploaded file / document: answer from documents only, never from live data
 }
 
 export const MAX_TOOLS_PER_QUESTION = 4;
+
+/** "in the devices file that I sent", "according to the document I uploaded", "from the manual" ... : the answer must come from the user's files. */
+const DOC_SCOPE = /\b(?:in|from|inside|within|according to|per|as per|using)\s+(?:the|this|that|my|our|your|these|those|an?)?\s*(?:[\w.-]+\s+){0,3}(?:files?|documents?|docs?|pdfs?|docx|csv|manuals?|upload(?:s|ed)?|attachments?)\b|\b(?:file|document|pdf|csv|manual)s?\b.{0,40}\b(?:i|we)\s+(?:sent|uploaded|attached|gave|shared)\b|\b(?:i|we)\s+(?:sent|uploaded|attached)\b|\bthe (?:uploaded|attached)\b/i;
+export const asksAboutFile = (question: string) => DOC_SCOPE.test(question);
 
 const METRIC_WORDS: [MetricKey, RegExp][] = [
   ['temperature', /\b(temperature|temp|hot|hottest|overheat\w*|thermal)\b/],
@@ -91,7 +96,8 @@ export async function planQuestion(question: string, selected?: DeviceRef | null
   const withDevice = (tool: ToolName, extra: Record<string, unknown> = {}) => devices.slice(0, 2).forEach((d) => add(tool, { deviceId: d.id, ...extra }));
   let needsDevice = false;
 
-  if (help) return { help: true, devices, metric, tools: [], needsDevice: false };
+  if (help) return { help: true, devices, metric, tools: [], needsDevice: false, docOnly: false };
+  if (asksAboutFile(question)) return { help: false, devices, metric, tools: [], needsDevice: false, docOnly: true };
 
   const asksWhy = /\b(why|explain|reason|how come|what caused)\b/.test(q) && /\b(risk|alert|predict\w*|flag\w*|warn\w*|anomal\w*|elevated|high|breach\w*)\b/.test(q);
   const asksTopRisk = /\b(highest|top|most|greatest|biggest)\b.*\b(risk|likely|danger|probab\w*)\b|\b(at risk|riskiest|likely to (fail|breach|exceed))\b/.test(q);
@@ -126,7 +132,7 @@ export async function planQuestion(question: string, selected?: DeviceRef | null
   if (dev && tools.length === 0 && !asksModel) withDevice('device_profile');
   if (dev && asksAlerts && !tools.some((t) => t.tool === 'device_profile' || t.tool === 'explain_prediction')) withDevice('device_profile');
 
-  return { help: false, devices, metric, tools, needsDevice };
+  return { help: false, devices, metric, tools, needsDevice, docOnly: false };
 }
 
 export const KNOWN_METRICS = METRIC_KEYS;

@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { q } from '../db';
+import { col, toApi, toApiList } from '../mongo';
+import { withDevice } from '../services/deviceQueries';
 import { publish } from '../services/events';
 import { audit, ctxOf } from '../services/audit';
 import { createIncident } from '../services/incidents';
@@ -10,13 +11,10 @@ export const incidentsRouter = Router();
 
 async function listIncidents(query: Record<string, string | undefined>, limit: number) {
   const { status, severity } = query;
-  const where: string[] = [];
-  const params: unknown[] = [];
-  if (status) { params.push(status); where.push(`i.status = $${params.length}`); }
-  if (severity) { params.push(severity); where.push(`i.severity = $${params.length}`); }
-  return q(
-    `SELECT i.*, d.name AS device_name FROM security_incidents i LEFT JOIN devices d ON d.id=i.device_id
-     ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY i.created_at DESC LIMIT ${limit}`, params);
+  const filter: Record<string, unknown> = {};
+  if (status) filter.status = status;
+  if (severity) filter.severity = severity;
+  return withDevice(toApiList(await col('security_incidents').find(filter).sort({ createdAt: -1 }).limit(limit).toArray()));
 }
 
 incidentsRouter.get('/', asyncH(async (req, res) => {
@@ -36,14 +34,23 @@ incidentsRouter.get('/export.csv', asyncH(async (req, res) => {
 }));
 
 incidentsRouter.get('/summary', asyncH(async (_req, res) => {
+  const incidents = col('security_incidents');
   const [bySeverity, byCategory, byStatus, trend] = await Promise.all([
-    q(`SELECT severity, count(*)::int AS count FROM security_incidents WHERE status <> 'resolved' GROUP BY severity`),
-    q(`SELECT category, count(*)::int AS count FROM security_incidents GROUP BY category ORDER BY count DESC`),
-    q(`SELECT status, count(*)::int AS count FROM security_incidents GROUP BY status`),
-    q(`SELECT date_trunc('hour', created_at) AS hour, count(*)::int AS count FROM security_incidents
-       WHERE created_at > now() - interval '24 hours' GROUP BY 1 ORDER BY 1`),
+    incidents.aggregate([{ $match: { status: { $ne: 'resolved' } } }, { $group: { _id: '$severity', count: { $sum: 1 } } }]).toArray(),
+    incidents.aggregate([{ $group: { _id: '$category', count: { $sum: 1 } } }, { $sort: { count: -1 } }]).toArray(),
+    incidents.aggregate([{ $group: { _id: '$status', count: { $sum: 1 } } }]).toArray(),
+    incidents.aggregate([
+      { $match: { createdAt: { $gt: new Date(Date.now() - 24 * 3600_000) } } },
+      { $group: { _id: { $dateTrunc: { date: '$createdAt', unit: 'hour' } }, count: { $sum: 1 } } },
+      { $sort: { _id: 1 } },
+    ]).toArray(),
   ]);
-  res.json({ bySeverity, byCategory, byStatus, trend });
+  res.json({
+    bySeverity: bySeverity.map((r) => ({ severity: r._id, count: r.count })),
+    byCategory: byCategory.map((r) => ({ category: r._id, count: r.count })),
+    byStatus: byStatus.map((r) => ({ status: r._id, count: r.count })),
+    trend: trend.map((r) => ({ hour: r._id, count: r.count })),
+  });
 }));
 
 incidentsRouter.post('/', asyncH(async (req, res) => {
@@ -60,9 +67,9 @@ incidentsRouter.post('/', asyncH(async (req, res) => {
 
 incidentsRouter.patch('/:id', asyncH(async (req, res) => {
   const { status } = z.object({ status: z.enum(['open', 'investigating', 'resolved']) }).parse(req.body);
-  const rows = await q('UPDATE security_incidents SET status=$2, updated_at=now() WHERE id=$1 RETURNING *', [req.params.id, status]);
-  if (!rows.length) throw new HttpError(404, 'Incident not found');
-  publish('incident', { id: rows[0].id });
+  const row = await col('security_incidents').findOneAndUpdate({ _id: Number(req.params.id) as any }, { $set: { status, updatedAt: new Date() } }, { returnDocument: 'after' });
+  if (!row) throw new HttpError(404, 'Incident not found');
+  publish('incident', { id: row._id });
   audit(ctxOf(req), 'incident.status', 'incident', req.params.id, { status });
-  res.json(rows[0]);
+  res.json(toApi(row));
 }));
