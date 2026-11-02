@@ -1,0 +1,13 @@
+**/node_modules
+**/dist
+**/.env
+**/*.log
+.git
+report
+backups
+e2e
+data
+**/.e2e-data
+**/.shots-data
+docs/demo
+docs/*.pptx

@@ -98,6 +98,20 @@ services:
     volumes: [ollamadata:/root/.ollama]
     ports: ["127.0.0.1:11435:11434"]
 
+  # Optional: a web page to browse MongoDB (for demos / viva). Not started by default:
+  #   docker compose --profile dbview up -d mongo-express      then open http://localhost:8081
+  mongo-express:
+    profiles: ["dbview"]
+    image: mongo-express:1.0.2
+    restart: unless-stopped
+    environment:
+      ME_CONFIG_MONGODB_URL: mongodb://iot:${MONGO_PASSWORD:-iot}@mongo:27017/?authSource=admin
+      ME_CONFIG_BASICAUTH: "false"        # reachable from this machine only (port bound to 127.0.0.1)
+      ME_CONFIG_OPTIONS_EDITORTHEME: default
+    ports: ["127.0.0.1:8081:8081"]
+    depends_on:
+      mongo: { condition: service_healthy }
+
 volumes:
   pgdata:
   mongodata:

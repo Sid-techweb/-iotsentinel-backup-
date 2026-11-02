@@ -1,5 +1,7 @@
 import cors from 'cors';
 import express, { NextFunction, Request, Response } from 'express';
+import fs from 'node:fs';
+import path from 'node:path';
 import helmet from 'helmet';
 import { ZodError } from 'zod';
 import { adminWrites, authenticate } from './auth';
@@ -33,7 +35,7 @@ export function createApp() {
   app.set('trust proxy', config.trustProxy);
   app.disable('x-powered-by');
   app.use(helmet());
-  app.use(cors({ origin: config.corsOrigin }));
+  app.use(cors({ origin: config.corsOrigin.includes(',') ? config.corsOrigin.split(',').map((o) => o.trim()) : config.corsOrigin })); // one origin, '*', or a comma-separated list
   app.use(express.json({ limit: '100kb' }));
   app.use('/api', rateLimit({ name: 'api', max: config.apiRequestsPerMinute }));
 
@@ -71,6 +73,19 @@ export function createApp() {
   app.use('/api/audit', auditRouter);
 
   app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found' }));
+
+  // single-origin deployment: serve the built frontend (hashed assets cached, the app shell always revalidated)
+  if (config.staticDir) {
+    const dir = path.resolve(config.staticDir);
+    if (fs.existsSync(path.join(dir, 'index.html'))) {
+      app.use(express.static(dir, { index: false, maxAge: '1h' }));
+      app.use((req: Request, res: Response, next: NextFunction) => {
+        if (req.method !== 'GET' || req.path.startsWith('/api')) return next();
+        res.setHeader('Cache-Control', 'no-cache');
+        res.sendFile(path.join(dir, 'index.html'));
+      });
+    }
+  }
 
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {

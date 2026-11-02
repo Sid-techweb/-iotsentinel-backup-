@@ -25,7 +25,7 @@ function cell(c: Col, v: unknown) {
 
 /** Reports: preview on screen, download as CSV (complete data) or PDF (for reading). */
 export default function Reports() {
-  const { data: list, error } = useQuery({ queryKey: ['/reports'], queryFn: () => api.get<Catalogue[]>('/reports') });
+  const { data: list, error } = useQuery({ queryKey: ['/reports'], queryFn: () => api.get<Catalogue[]>('/reports/') });
   const { data: types } = useQuery({ queryKey: ['/device-types'], queryFn: () => api.get<DeviceType[]>('/device-types') });
   const { data: devices } = useQuery({ queryKey: ['/devices'], queryFn: () => api.get<Device[]>('/devices') });
   const [id, setId] = useState('device-health');

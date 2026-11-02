@@ -26,7 +26,7 @@ function mock(rows: object[]) {
     const url = String(input);
     calls.push(url);
     if (url === '/api/auth/me') return json({ id: 'u1', email: 'a@b.c', name: 'Ada', role: 'viewer' });
-    if (url === '/api/reports') return json(CATALOGUE);
+    if (url === '/api/reports/') return json(CATALOGUE);
     if (url.startsWith('/api/reports/device-health/csv') || url.startsWith('/api/reports/device-health/pdf')) return new Response('x', { status: 200 });
     if (url.startsWith('/api/reports/alert-history')) return json(preview('alert-history', []));
     if (url.startsWith('/api/reports/device-health')) return json(preview('device-health', rows));

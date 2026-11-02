@@ -45,6 +45,8 @@ export const config = {
   retentionDays: num('TELEMETRY_RETENTION_DAYS', 7),
   predictionHistoryDays: num('PREDICTION_HISTORY_DAYS', 30),
   corsOrigin: str('CORS_ORIGIN', '*'),
+  // When set (cloud image), the API also serves the built React app from this folder - one URL for everything.
+  staticDir: str('STATIC_DIR', ''),
   // webhooks may not target private networks unless explicitly allowed (local development / tests)
   allowPrivateWebhooks: (process.env.ALLOW_PRIVATE_WEBHOOKS ?? 'false') === 'true',
   rateLimit: (process.env.RATE_LIMIT ?? 'true') === 'true',
@@ -67,6 +69,9 @@ export const config = {
   llmProvider: str('LLM_PROVIDER', 'ollama'),
   ollamaUrl: str('OLLAMA_URL', 'http://localhost:11434').replace(/\/+$/, ''),
   llmModel: str('LLM_MODEL', 'qwen2.5:7b'),
+  // OpenAI-compatible API (LLM_PROVIDER=openai): Gemini, Groq, OpenRouter, ... The key is read from the environment only.
+  llmBaseUrl: str('LLM_BASE_URL', ''),
+  llmApiKey: process.env.LLM_API_KEY ?? '',
   embedModel: str('EMBED_MODEL', 'qwen3-embedding:0.6b'),
   embedDim: num('EMBED_DIM', 1024),   // must match the vector(N) column created by migration 003
   // Some embedding models want a task prefix: e.g. nomic-embed-text uses "search_document: " / "search_query: ".

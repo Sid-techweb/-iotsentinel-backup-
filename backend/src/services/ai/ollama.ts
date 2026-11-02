@@ -24,7 +24,7 @@ export class OllamaProvider implements LLMProvider {
     } catch (e) {
       if (init.signal?.aborted) throw e; // the caller cancelled: not a provider failure
       if (timeout.aborted) throw new AIProviderError('timeout', `Ollama did not answer within ${Math.round(timeoutMs / 1000)} s (${path}). The model may still be loading - try again, or raise LLM_TIMEOUT_MS.`, 504);
-      throw new AIProviderError('unavailable', `Cannot reach Ollama at ${base()}. Start it ("ollama serve") or set OLLAMA_URL. (${(e as Error).message})`);
+      throw new AIProviderError('unavailable', `The local AI model is not connected (cannot reach Ollama at ${base()}). Everything else in the platform keeps working. To use the assistant, start Ollama ("ollama serve") or set OLLAMA_URL. (${(e as Error).message})`);
     }
   }
 

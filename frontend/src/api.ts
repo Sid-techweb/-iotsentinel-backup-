@@ -1,6 +1,9 @@
 import { useQuery } from '@tanstack/react-query';
 import { isPushConnected } from './live';
 
+/** Empty in development and in Docker (nginx proxies /api). On Vercel, set VITE_API_URL to the backend gateway URL. */
+export const API_BASE = ((import.meta.env.VITE_API_URL as string | undefined) ?? '').replace(/\/+$/, '');
+
 export type Status = 'online' | 'offline' | 'degraded';
 export type MetricKey = 'temperature' | 'cpu' | 'memory' | 'battery' | 'signal' | 'vibration' | 'pressure' | 'current';
 export type Severity = 'info' | 'warning' | 'critical';
@@ -143,7 +146,7 @@ export const setUnauthorizedHandler = (fn: (() => void) | null) => { onUnauthori
 const authHeader = (): Record<string, string> => (token ? { Authorization: 'Bearer ' + token } : {});
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`/api${path}`, { headers: { 'Content-Type': 'application/json', ...authHeader() }, ...init });
+  const res = await fetch(`${API_BASE}/api${path}`, { headers: { 'Content-Type': 'application/json', ...authHeader() }, ...init });
   if (res.status === 401 && !path.startsWith('/auth/login') && !path.startsWith('/auth/register')) onUnauthorized?.();
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
@@ -162,7 +165,7 @@ export const api = {
 
 /** Download an authenticated CSV export (a plain link cannot carry the sign-in header). */
 export async function downloadCsv(path: string, filename: string) {
-  const res = await fetch(`/api${path}`, { headers: authHeader() });
+  const res = await fetch(`${API_BASE}/api${path}`, { headers: authHeader() });
   if (!res.ok) throw new Error(`Export failed (${res.status})`);
   const url = URL.createObjectURL(await res.blob());
   const a = document.createElement('a');
@@ -226,7 +229,7 @@ export interface AssistantHealth {
 
 /** Upload a file with extra form fields (the JSON content-type header must not be set for multipart). */
 export async function uploadForm<T>(path: string, form: FormData): Promise<T> {
-  const res = await fetch(`/api${path}`, { method: 'POST', headers: authHeader(), body: form });
+  const res = await fetch(`${API_BASE}/api${path}`, { method: 'POST', headers: authHeader(), body: form });
   if (res.status === 401) onUnauthorized?.();
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(body.error ?? `${res.status} ${res.statusText}`);
@@ -235,7 +238,7 @@ export async function uploadForm<T>(path: string, form: FormData): Promise<T> {
 
 /** Download any authenticated file (the sign-in header cannot ride on a plain link). */
 export async function downloadFile(path: string, filename: string) {
-  const res = await fetch(`/api${path}`, { headers: authHeader() });
+  const res = await fetch(`${API_BASE}/api${path}`, { headers: authHeader() });
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new Error(body.error ?? `Download failed (${res.status})`);
@@ -260,7 +263,7 @@ export interface StreamHandlers {
  * Failures before streaming starts (provider down, rate limit) come back as a normal JSON error and are thrown.
  */
 export async function streamAnswer(path: string, body: unknown, h: StreamHandlers, signal?: AbortSignal): Promise<void> {
-  const res = await fetch(`/api${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream', ...authHeader() }, body: JSON.stringify(body ?? {}), signal });
+  const res = await fetch(`${API_BASE}/api${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream', ...authHeader() }, body: JSON.stringify(body ?? {}), signal });
   if (res.status === 401) onUnauthorized?.();
   if (!res.ok || !res.body) {
     const err = await res.json().catch(() => ({}));

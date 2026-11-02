@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from 'react';
+import { API_BASE } from './api';
 
 /**
  * Server-Sent Events client. The browser opens one authenticated stream; every event the
@@ -32,7 +33,7 @@ export function connectEvents(getToken: () => string | null, onEvent: (e: PushEv
       if (!token) { await new Promise((r) => setTimeout(r, 1000)); continue; }
       controller = new AbortController();
       try {
-        const res = await fetch('/api/events', { headers: { Authorization: `Bearer ${token}`, Accept: 'text/event-stream' }, signal: controller.signal });
+        const res = await fetch(`${API_BASE}/api/events`, { headers: { Authorization: `Bearer ${token}`, Accept: 'text/event-stream' }, signal: controller.signal });
         if (!res.ok || !res.body) throw new Error(`stream refused (${res.status})`);
         retry = 1000;
         const reader = res.body.getReader();

@@ -52,13 +52,17 @@ export function getProvider(): LLMProvider {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { OllamaProvider } = require('./ollama') as typeof import('./ollama');
     instance = new OllamaProvider();
+  } else if (config.llmProvider === 'openai') {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { OpenAICompatProvider } = require('./openai') as typeof import('./openai');
+    instance = new OpenAICompatProvider();
   } else if (config.llmProvider === 'deterministic-test') {
     if (process.env.NODE_ENV === 'production') throw new AIProviderError('disabled', 'LLM_PROVIDER=deterministic-test is for automated tests only and is refused in production', 500);
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { DeterministicTestProvider } = require('./testProvider') as typeof import('./testProvider');
     instance = new DeterministicTestProvider();
   } else {
-    throw new AIProviderError('disabled', `Unknown LLM_PROVIDER "${config.llmProvider}". Supported: ollama`, 500);
+    throw new AIProviderError('disabled', `Unknown LLM_PROVIDER "${config.llmProvider}". Supported: ollama, openai`, 500);
   }
   return instance;
 }
