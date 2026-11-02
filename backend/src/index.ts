@@ -14,7 +14,7 @@ import { sleep } from './util';
 
 async function waitFor(name: string, fn: () => Promise<unknown>) {
   for (let i = 0; i < 30; i++) {
-    try { await fn(); return; } catch { console.log(`[boot] waiting for ${name}...`); await sleep(1500); }
+    try { await fn(); return; } catch (e) { console.log(`[boot] waiting for ${name}... (${((e as Error).message ?? String(e)).slice(0, 200)})`); await sleep(1500); }
   }
   throw new Error(`${name} did not become ready`);
 }
